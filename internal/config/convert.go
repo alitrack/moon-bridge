@@ -17,8 +17,10 @@ func (cfg Config) ToFileConfig() FileConfig {
 			Format: cfg.LogFormat,
 		},
 		Server: ServerFileConfig{
-			Addr:      cfg.Addr,
-			AuthToken: cfg.AuthToken,
+			Addr:        cfg.Addr,
+			AuthToken:   cfg.AuthToken,
+			MaxSessions: cfg.MaxSessions,
+			SessionTTL:  cfg.SessionTTL,
 		},
 		Defaults: DefaultsFileConfig{
 			Model:        cfg.Defaults.Model,
@@ -106,16 +108,16 @@ func toModelDefFileConfig(def ModelDef) ModelDefFileConfig {
 	}
 
 	m := ModelDefFileConfig{
-		ContextWindow:               def.ContextWindow,
-		MaxOutputTokens:             def.MaxOutputTokens,
-		DisplayName:                 def.DisplayName,
-		Description:                 def.Description,
-		BaseInstructions:            def.BaseInstructions,
-		DefaultReasoningLevel:       def.DefaultReasoningLevel,
-		SupportedReasoningLevels:    reasoningPresets,
-		DefaultReasoningSummary:     def.DefaultReasoningSummary,
-		InputModalities:             def.InputModalities,
-		WebSearch:                   toWebSearchFileConfig(def.WebSearch),
+		ContextWindow:            def.ContextWindow,
+		MaxOutputTokens:          def.MaxOutputTokens,
+		DisplayName:              def.DisplayName,
+		Description:              def.Description,
+		BaseInstructions:         def.BaseInstructions,
+		DefaultReasoningLevel:    def.DefaultReasoningLevel,
+		SupportedReasoningLevels: reasoningPresets,
+		DefaultReasoningSummary:  def.DefaultReasoningSummary,
+		InputModalities:          def.InputModalities,
+		WebSearch:                toWebSearchFileConfig(def.WebSearch),
 	}
 
 	if def.SupportsReasoningSummaries {

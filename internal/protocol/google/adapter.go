@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 
 	"moonbridge/internal/format"
@@ -25,8 +26,8 @@ import (
 // Only references: config, format, and google types.
 type GeminiProviderAdapter struct {
 	cfgMaxTokens int
-	client *Client
-	hooks format.CorePluginHooks
+	client       *Client
+	hooks        format.CorePluginHooks
 
 	// Cache config and registry (nil = caching disabled).
 	cacheCfg *cache.PlanCacheConfig
@@ -53,11 +54,11 @@ type GeminiProviderAdapter struct {
 // is registered for type conversion only (dispatch layer manages the client).
 func NewGeminiProviderAdapter(cfgMaxTokens int, client *Client, hooks format.CorePluginHooks, cacheCfg *cache.PlanCacheConfig, registry *cache.MemoryRegistry) *GeminiProviderAdapter {
 	return &GeminiProviderAdapter{
-		cfgMaxTokens: cfgMaxTokens,
-		client:    client,
-		hooks:     hooks.WithDefaults(),
-		cacheCfg:  cacheCfg,
-		registry:  registry,
+		cfgMaxTokens:  cfgMaxTokens,
+		client:        client,
+		hooks:         hooks.WithDefaults(),
+		cacheCfg:      cacheCfg,
+		registry:      registry,
 		prevSnapshots: make(map[int]string),
 	}
 
@@ -375,9 +376,9 @@ func (a *GeminiProviderAdapter) ToCoreStream(ctx context.Context, src any) (<-ch
 				// Track usage from the last chunk.
 				if chunk.UsageMetadata != nil {
 					finalUsage = &format.CoreUsage{
-						InputTokens:  chunk.UsageMetadata.PromptTokenCount,
-						OutputTokens: chunk.UsageMetadata.CandidatesTokenCount,
-						TotalTokens:  chunk.UsageMetadata.TotalTokenCount,
+						InputTokens:       chunk.UsageMetadata.PromptTokenCount,
+						OutputTokens:      chunk.UsageMetadata.CandidatesTokenCount,
+						TotalTokens:       chunk.UsageMetadata.TotalTokenCount,
 						CachedInputTokens: chunk.UsageMetadata.CachedContentTokenCount,
 					}
 				}
@@ -406,47 +407,47 @@ func (a *GeminiProviderAdapter) blocksToContent(blocks []format.CoreContentBlock
 					Data:     b.ImageData,
 				},
 			})
-	case "tool_use":
-		// Store ToolUseID -> ToolName mapping for later FunctionResponse resolution (G-01).
-		a.toolUseIDMu.Lock()
-		a.toolUseIDMap[b.ToolUseID] = b.ToolName
-		a.toolUseIDMu.Unlock()
-		parts = append(parts, Part{
-			FunctionCall: &FunctionCall{
-				Name: b.ToolName,
-				Args: b.ToolInput,
-			},
-		})
-	case "tool_result":
-		// Look up the function name from ToolUseID (G-01).
-		funcName := b.ToolUseID
-		a.toolUseIDMu.Lock()
-		if fn, ok := a.toolUseIDMap[b.ToolUseID]; ok {
-			funcName = fn
-		}
-		a.toolUseIDMu.Unlock()
-
-		// Combine tool result content into a single text for the response.
-		var respText string
-		if len(b.ToolResultContent) > 0 {
-			for _, tc := range b.ToolResultContent {
-				respText += tc.Text
+		case "tool_use":
+			// Store ToolUseID -> ToolName mapping for later FunctionResponse resolution (G-01).
+			a.toolUseIDMu.Lock()
+			a.toolUseIDMap[b.ToolUseID] = b.ToolName
+			a.toolUseIDMu.Unlock()
+			parts = append(parts, Part{
+				FunctionCall: &FunctionCall{
+					Name: b.ToolName,
+					Args: b.ToolInput,
+				},
+			})
+		case "tool_result":
+			// Look up the function name from ToolUseID (G-01).
+			funcName := b.ToolUseID
+			a.toolUseIDMu.Lock()
+			if fn, ok := a.toolUseIDMap[b.ToolUseID]; ok {
+				funcName = fn
 			}
-		}
-		respMap := map[string]any{"response": respText}
-		respRaw, _ := marshalRaw(respMap)
-		parts = append(parts, Part{
-			FunctionResponse: &FunctionResponse{
-				Name:     funcName,
-				Response: respRaw,
-			},
-		})
-	case "reasoning":
-		// Gemini does not natively support a "reasoning" content type, so
-		// convert reasoning text to a regular text Part to retain the content (G-06).
-		if b.ReasoningText != "" {
-			parts = append(parts, Part{Text: b.ReasoningText})
-		}
+			a.toolUseIDMu.Unlock()
+
+			// Combine tool result content into a single text for the response.
+			var respText string
+			if len(b.ToolResultContent) > 0 {
+				for _, tc := range b.ToolResultContent {
+					respText += tc.Text
+				}
+			}
+			respMap := map[string]any{"response": respText}
+			respRaw, _ := marshalRaw(respMap)
+			parts = append(parts, Part{
+				FunctionResponse: &FunctionResponse{
+					Name:     funcName,
+					Response: respRaw,
+				},
+			})
+		case "reasoning":
+			// Gemini does not natively support a "reasoning" content type, so
+			// convert reasoning text to a regular text Part to retain the content (G-06).
+			if b.ReasoningText != "" {
+				parts = append(parts, Part{Text: b.ReasoningText})
+			}
 		default:
 			// Fallback: treat unknown types as text.
 			if b.Text != "" {
@@ -552,14 +553,15 @@ func (a *GeminiProviderAdapter) applyGenerationConfigMap(gc *GenerationConfig, c
 // fromParts converts Gemini Parts to []CoreContentBlock.
 func (a *GeminiProviderAdapter) fromParts(parts []Part) []format.CoreContentBlock {
 	result := make([]format.CoreContentBlock, 0, len(parts))
+	funcCallSeq := make(map[string]int)
 	for _, p := range parts {
-		result = append(result, a.fromPart(p))
+		result = append(result, a.fromPartWithSeq(p, funcCallSeq))
 	}
 	return result
 }
 
-// fromPart converts a single Gemini Part to CoreContentBlock.
-func (a *GeminiProviderAdapter) fromPart(p Part) format.CoreContentBlock {
+// fromPartWithSeq converts a single Gemini Part to CoreContentBlock.
+func (a *GeminiProviderAdapter) fromPartWithSeq(p Part, funcCallSeq map[string]int) format.CoreContentBlock {
 	switch {
 	case p.Text != "":
 		return format.CoreContentBlock{
@@ -567,10 +569,13 @@ func (a *GeminiProviderAdapter) fromPart(p Part) format.CoreContentBlock {
 			Text: p.Text,
 		}
 	case p.FunctionCall != nil:
+		callName := p.FunctionCall.Name
+		funcCallSeq[callName]++
+		callID := callName + "__call_" + strconv.Itoa(funcCallSeq[callName])
 		return format.CoreContentBlock{
 			Type:      "tool_use",
-			ToolUseID: p.FunctionCall.Name, // Gemini uses function name as identifier
-			ToolName:  p.FunctionCall.Name,
+			ToolUseID: callID,
+			ToolName:  callName,
 			ToolInput: p.FunctionCall.Args,
 		}
 	case p.FunctionResponse != nil:

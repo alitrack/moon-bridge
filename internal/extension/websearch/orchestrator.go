@@ -93,7 +93,7 @@ func NewInjectedOrchestrator(cfg OrchestratorConfig) *Orchestrator {
 // tool loops. The caller receives a fully resolved response.
 func (o *Orchestrator) CreateMessage(ctx context.Context, req anthropic.MessageRequest) (anthropic.MessageResponse, error) {
 	log := slog.Default()
-	for round := 0; round <= o.maxRounds; round++ {
+	for round := 0; round < o.maxRounds; round++ {
 		resp, err := o.anthropic.CreateMessage(ctx, req)
 		if err != nil {
 			return anthropic.MessageResponse{}, err
@@ -103,7 +103,7 @@ func (o *Orchestrator) CreateMessage(ctx context.Context, req anthropic.MessageR
 			return resp, nil
 		}
 
-		toolUses, otherBlocks := splitToolUses(resp.Content)
+		toolUses, _ := splitToolUses(resp.Content)
 		searchUses := o.filterSearchTools(toolUses)
 		nonSearchUses := subtractToolUses(toolUses, searchUses)
 
@@ -141,7 +141,7 @@ func (o *Orchestrator) CreateMessage(ctx context.Context, req anthropic.MessageR
 		// user message (with tool_results) to the request for the next round.
 		req.Messages = append(req.Messages, anthropic.Message{
 			Role:    "assistant",
-			Content: toContentBlocks(append(searchUses, otherBlocks...)),
+			Content: resp.Content,
 		})
 		req.Messages = append(req.Messages, anthropic.Message{
 			Role:    "user",
@@ -159,7 +159,7 @@ func (o *Orchestrator) CreateMessage(ctx context.Context, req anthropic.MessageR
 func (o *Orchestrator) StreamMessage(ctx context.Context, req anthropic.MessageRequest) (anthropic.Stream, error) {
 	log := slog.Default()
 	var allEvents []anthropic.StreamEvent
-	for round := 0; round <= o.maxRounds; round++ {
+	for round := 0; round < o.maxRounds; round++ {
 		stream, err := o.anthropic.StreamMessage(ctx, req)
 		if err != nil {
 			return nil, err
@@ -382,13 +382,6 @@ func subtractToolUses(a, b []anthropic.ContentBlock) []anthropic.ContentBlock {
 		}
 	}
 	return result
-}
-
-// toContentBlocks converts tool_use blocks to generic content blocks.
-func toContentBlocks(toolUses []anthropic.ContentBlock) []anthropic.ContentBlock {
-	blocks := make([]anthropic.ContentBlock, len(toolUses))
-	copy(blocks, toolUses)
-	return blocks
 }
 
 // collectStream reads all events from a stream into a slice.

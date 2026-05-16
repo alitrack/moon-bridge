@@ -13,8 +13,8 @@ import (
 	"sort"
 	"strings"
 
-	"moonbridge/internal/extension/visual"
 	"moonbridge/internal/config"
+	"moonbridge/internal/extension/visual"
 	"moonbridge/internal/modelref"
 )
 
@@ -492,7 +492,7 @@ func routeFor(providerCfg config.ProviderConfig, modelAlias string) config.Route
 // GenerateConfigToml writes a Codex config.toml fragment to output for a given
 // model alias. If codexHome is non-empty, it also writes models_catalog.json
 // there and adds a model_catalog_json pointer.
-func GenerateConfigToml(output io.Writer, modelAlias string, baseURL string, codexHome string, providerCfg config.ProviderConfig, serverCfg config.ServerConfig) error {
+func GenerateConfigToml(output io.Writer, modelAlias string, baseURL string, codexHome string, providerCfg config.ProviderConfig, pluginCfg config.PluginConfig, serverCfg config.ServerConfig) error {
 	route := routeFor(providerCfg, modelAlias)
 
 	// When modelAlias is a direct provider/model reference (not a named route),
@@ -503,8 +503,6 @@ func GenerateConfigToml(output io.Writer, modelAlias string, baseURL string, cod
 			catalogAlias = model + "(" + provider + ")"
 		}
 	}
-
-	pluginCfg := config.PluginConfig{}
 
 	fmt.Fprintf(output, "model = %q\n", catalogAlias)
 	fmt.Fprintln(output, `model_provider = "moonbridge"`)
@@ -552,7 +550,7 @@ func writeAuthJSON(path, token string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}

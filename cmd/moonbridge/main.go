@@ -11,8 +11,8 @@ import (
 	"syscall"
 
 	"log/slog"
-	"moonbridge/internal/extension/codex"
 	"moonbridge/internal/config"
+	"moonbridge/internal/extension/codex"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/service/app"
 )
@@ -117,7 +117,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	}
 	if *printCodexConfig != "" {
 		if err := codex.GenerateConfigToml(stdout, *printCodexConfig, *codexBaseURL, *codexHome,
-			config.ProviderFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg)); err != nil {
+			config.ProviderFromGlobalConfig(&cfg), config.PluginFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg)); err != nil {
 			writeStartupError(stderr, "生成 Codex 配置失败", resolvedConfigPath, err,
 				"确认 -codex-home 目录可写，或去掉 -codex-home 只打印 config.toml。")
 			return exitRuntimeErr

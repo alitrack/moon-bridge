@@ -8,12 +8,13 @@ import (
 
 	"moonbridge/internal/service/app"
 
+	"log/slog"
 	"moonbridge/internal/config"
 	"moonbridge/internal/db"
-	"log/slog"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/service/provider"
+	"moonbridge/internal/service/runtime"
 	"moonbridge/internal/service/server"
 	"moonbridge/internal/service/stats"
 
@@ -66,6 +67,7 @@ func main() {
 	if len(pricing) > 0 {
 		sessionStats.SetPricing(pricing)
 	}
+	rt := runtime.NewRuntime(cfg, providerMgr, pricing)
 	cat := app.BuiltinExtensionCatalog{}
 	if d1Cfg := cfg.ExtensionRawConfig("db_d1", ""); len(d1Cfg) > 0 {
 		if binding, ok := d1Cfg["binding"].(string); ok && binding != "" {
@@ -82,6 +84,12 @@ func main() {
 		}
 	}
 	plugins := cat.NewRegistry(slog.Default(), cfg)
+	plugins.SetCurrentConfigProvider(func() config.Config {
+		if rt.Current() != nil {
+			return rt.Current().Config
+		}
+		return cfg
+	})
 	if err := plugins.InitAll(&cfg); err != nil {
 		slog.Error("init plugins", "error", err)
 		os.Exit(1)
@@ -97,9 +105,12 @@ func main() {
 	// Initialize persistence layer (db.Registry).
 	ctx := context.Background()
 	dbRegistry := db.NewRegistry(slog.Default())
-	for _, p := range plugins.DBProviders() {
+	dbProviders := plugins.DBProviders()
+	providers := make([]db.Provider, 0, len(dbProviders))
+	for _, p := range dbProviders {
 		if prov := p.DBProvider(); prov != nil {
 			dbRegistry.RegisterProvider(prov)
+			providers = append(providers, prov)
 		}
 	}
 	for _, c := range plugins.DBConsumers() {
@@ -107,18 +118,20 @@ func main() {
 			dbRegistry.RegisterConsumer(cons)
 		}
 	}
-	if err := dbRegistry.Init(ctx, cfg.Persistence.ActiveProvider); err != nil {
+	activePersistenceProvider := app.ResolvePersistenceActiveProvider(cfg.Persistence.ActiveProvider, providers)
+	if err := dbRegistry.Init(ctx, activePersistenceProvider); err != nil {
 		slog.Error("init persistence", "error", err)
 		os.Exit(1)
 	}
 	defer dbRegistry.Shutdown()
 
 	handler := server.New(server.Config{
-		Provider:       defaultClient,
+		Provider:       provider.NewAnthropicClientAdapter(defaultClient),
 		ProviderMgr:    providerMgr,
 		Stats:          sessionStats,
 		PluginRegistry: plugins,
-		AppConfig:      cfg,
+		AppConfig:      config.ServerFromGlobalConfig(&cfg),
+		Runtime:        rt,
 	})
 
 	workers.Serve(handler)
@@ -191,12 +204,17 @@ func resolveDefaultClient(pm *provider.ProviderManager) *anthropic.Client {
 		for _, key := range pm.ProviderKeys() {
 			c, err := pm.ClientForKey(key)
 			if err == nil {
-				return c
+				if acc, ok := c.(provider.AnthropicClientAccessor); ok {
+					return acc.AnthropicClient()
+				}
 			}
 		}
 		return nil
 	}
-	return client
+	if acc, ok := client.(provider.AnthropicClientAccessor); ok {
+		return acc.AnthropicClient()
+	}
+	return nil
 }
 
 func isDevEnv() bool {

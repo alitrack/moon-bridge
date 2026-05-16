@@ -57,6 +57,7 @@ func (s *Server) handleWithAdapters(
 ) {
 	ctx := r.Context()
 	log := slog.Default().With("model", openAIReq.Model, "path", "adapter")
+	pm := s.activeProviderManager()
 
 	// Defense-in-depth: ensure model is non-empty.
 	if openAIReq.Model == "" {
@@ -169,9 +170,12 @@ func (s *Server) handleWithAdapters(
 	// the upstream provider receives the correct model identifier.
 	coreReq.Model = preferred.UpstreamModel
 
+	wsMode := resolvedWebSearchMode(pm, openAIReq.Model, preferred)
+
 	// Inject web search tools at Core level if mode is "injected".
-	// This replaces web_search with tavily_search/firecrawl_fetch tools.
-	wsInjected := s.injectCoreWebSearch(ctx, coreReq, preferred, openAIReq)
+	// This replaces web_search/web_search_preview with tavily_search/firecrawl_fetch tools.
+	wsInjected := s.injectCoreWebSearch(ctx, coreReq, preferred, openAIReq, wsMode)
+	searchCfg := s.resolvedSearchConfig(preferred.ProviderKey, openAIReq.Model)
 
 	upstreamAny, err := providerAdapter.FromCoreRequest(ctx, coreReq)
 	if err != nil {
@@ -208,8 +212,8 @@ func (s *Server) handleWithAdapters(
 			return
 		}
 
-		// Inject web_search tool if enabled for this model.
-		if s.providerMgr.ResolvedWebSearch(preferred.ProviderKey) == "enabled" {
+		// Inject native web_search tool when the resolved candidate supports it.
+		if wsMode == "enabled" {
 			injectAnthropicWebSearch(upstreamReq)
 		}
 
@@ -218,9 +222,23 @@ func (s *Server) handleWithAdapters(
 			prependCachedThinking(upstreamReq, sess)
 		}
 
+		finalizeAnthropicUpstream := func(_ context.Context, upstream any) (any, error) {
+			msgReq, err := normalizeAnthropicRequest(upstream)
+			if err != nil {
+				return nil, err
+			}
+			if wsMode == "enabled" {
+				injectAnthropicWebSearch(&msgReq)
+			}
+			if s.pluginRegistry != nil && sess != nil {
+				prependCachedThinking(&msgReq, sess)
+			}
+			return &msgReq, nil
+		}
+
 		// If streaming, use streaming path.
 		if openAIReq.Stream {
-			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, upstreamReq, preferred, wsInjected)
+			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, upstreamReq, preferred, wsMode, wsInjected)
 			record.OpenAIRequest = nil
 			return
 		}
@@ -244,11 +262,10 @@ func (s *Server) handleWithAdapters(
 
 		// Wrap provider with search orchestrator if web search is "injected".
 		if wsInjected {
-			if acc, ok := effectiveProvider.(provider.AnthropicClientAccessor); ok && s.runtime != nil {
-				cfgC := s.runtime.Current().Config
+			if acc, ok := effectiveProvider.(provider.AnthropicClientAccessor); ok {
 				wrapped := websearchinjected.WrapProvider(
 					acc.AnthropicClient(),
-					cfgC.TavilyAPIKey, cfgC.FirecrawlAPIKey, s.maxSearchRounds(),
+					searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds,
 				)
 				effectiveProvider = &searchProviderAdapter{wrapped: wrapped}
 			}
@@ -256,7 +273,7 @@ func (s *Server) handleWithAdapters(
 
 		// Wrap with visual orchestrator at Core level if enabled for this model.
 		// This uses CoreProvider, which is protocol-agnostic.
-		if visProv := s.wrapWithVisual(ctx, openAIReq.Model, preferred, providerAdapter, sess); visProv != nil {
+		if visProv := s.wrapWithVisual(ctx, openAIReq.Model, preferred, providerAdapter, finalizeAnthropicUpstream); visProv != nil {
 			var coreRespApi *format.CoreResponse
 			coreRespApi, err = visProv.CreateCore(ctx, coreReq)
 			if err == nil {
@@ -316,13 +333,13 @@ func (s *Server) handleWithAdapters(
 		}
 
 		if openAIReq.Stream {
-			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, chatReq, preferred, wsInjected)
+			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, chatReq, preferred, wsMode, wsInjected)
 			record.OpenAIRequest = nil
 			return
 		}
 
-		chatClientRaw, ok := s.chatClients[preferred.ProviderKey]
-		if !ok {
+		chatClientRaw := s.activeChatClient(preferred.ProviderKey)
+		if chatClientRaw == nil {
 			log.Error("adapter path: no chat client for provider", "provider", preferred.ProviderKey)
 			payload := openai.ErrorResponse{
 				Error: openai.ErrorObject{
@@ -355,7 +372,7 @@ func (s *Server) handleWithAdapters(
 		record.ChatRequest = chatReq
 		var chatResp *chat.ChatResponse
 		if wsInjected {
-			chatResp, err = s.executeChatSearchLoop(ctx, chatClient, chatReq, s.runtime.Current().Config.TavilyAPIKey, s.runtime.Current().Config.FirecrawlAPIKey, s.maxSearchRounds())
+			chatResp, err = s.executeChatSearchLoop(ctx, chatClient, chatReq, searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds)
 		} else {
 			chatResp, err = chatClient.CreateChat(ctx, chatReq)
 		}
@@ -423,13 +440,13 @@ func (s *Server) handleWithAdapters(
 		}
 
 		if openAIReq.Stream {
-			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, googleReq, preferred, wsInjected)
+			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, googleReq, preferred, wsMode, wsInjected)
 			record.OpenAIRequest = nil
 			return
 		}
 
-		googleClientRaw, ok := s.googleClients[preferred.ProviderKey]
-		if !ok {
+		googleClientRaw := s.activeGoogleClient(preferred.ProviderKey)
+		if googleClientRaw == nil {
 			log.Error("adapter path: no google client for provider", "provider", preferred.ProviderKey)
 			payload := openai.ErrorResponse{
 				Error: openai.ErrorObject{
@@ -462,7 +479,7 @@ func (s *Server) handleWithAdapters(
 		record.UpstreamRequest = googleReq
 		var googleResp *google.GenerateContentResponse
 		if wsInjected {
-			googleResp, err = s.executeGoogleSearchLoop(ctx, googleClient, preferred.UpstreamModel, googleReq, s.runtime.Current().Config.TavilyAPIKey, s.runtime.Current().Config.FirecrawlAPIKey, s.maxSearchRounds())
+			googleResp, err = s.executeGoogleSearchLoop(ctx, googleClient, preferred.UpstreamModel, googleReq, searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds)
 		} else {
 			googleResp, err = googleClient.GenerateContent(ctx, preferred.UpstreamModel, googleReq)
 		}
@@ -528,7 +545,6 @@ func (s *Server) handleWithAdapters(
 	}
 
 	// ------------------------------------------------------------------
-
 
 	// Propagate codex_tool_map from CoreRequest to CoreResponse.
 	if coreReq != nil && coreResp != nil && coreReq.Extensions != nil {
@@ -613,7 +629,7 @@ func (s *Server) handleWithAdapters(
 			CacheCreationInputTokens: 0,
 			CacheReadInputTokens:     cachedInput,
 		}
-		reqCost := computeCostWithProviderPricing(s.providerMgr, s.stats, openAIReq.Model, preferred.UpstreamModel, preferred.ProviderKey, billingUsage)
+		reqCost := computeCostWithProviderPricing(pm, s.stats, openAIReq.Model, preferred.UpstreamModel, preferred.ProviderKey, billingUsage)
 		log.Info("请求完成",
 			"request_model", openAIReq.Model,
 			"actual_model", preferred.UpstreamModel,
@@ -655,9 +671,11 @@ func (s *Server) handleAdapterStream(
 	coreReq *format.CoreRequest,
 	upstreamReq any,
 	candidate provider.ProviderCandidate,
+	wsMode string,
 	wsInjected bool,
 ) {
 	log := slog.Default().With("model", openAIReq.Model, "path", "adapter_stream")
+	pm := s.activeProviderManager()
 
 	// Track when the request started for latency measurement.
 	requestStart := time.Now()
@@ -679,7 +697,20 @@ func (s *Server) handleAdapterStream(
 
 	if candidate.Protocol == config.ProtocolAnthropic && coreRequestHasImage(coreReq) {
 		if providerAdapter := s.adapterRegistryProvider(config.ProtocolAnthropic); providerAdapter != nil {
-			if visProv := s.wrapWithVisual(ctx, openAIReq.Model, candidate, providerAdapter, sess); visProv != nil {
+			finalizeAnthropicUpstream := func(_ context.Context, upstream any) (any, error) {
+				msgReq, err := normalizeAnthropicRequest(upstream)
+				if err != nil {
+					return nil, err
+				}
+				if wsMode == "enabled" {
+					injectAnthropicWebSearch(&msgReq)
+				}
+				if s.pluginRegistry != nil && sess != nil {
+					prependCachedThinking(&msgReq, sess)
+				}
+				return &msgReq, nil
+			}
+			if visProv := s.wrapWithVisual(ctx, openAIReq.Model, candidate, providerAdapter, finalizeAnthropicUpstream); visProv != nil {
 				coreResp, err := visProv.CreateCore(ctx, coreReq)
 				if err != nil {
 					log.Error("adapter stream visual fallback: CreateCore failed", "error", err)
@@ -741,6 +772,26 @@ func (s *Server) handleAdapterStream(
 			return
 		}
 
+		var visCoreProvider visualpkg.CoreProvider
+		if provAdapter, ok := s.adapterRegistry.GetProvider(candidate.Protocol); ok {
+			finalizeAnthropicUpstream := func(_ context.Context, upstream any) (any, error) {
+				msgReq, err := normalizeAnthropicRequest(upstream)
+				if err != nil {
+					return nil, err
+				}
+				if wsMode == "enabled" {
+					injectAnthropicWebSearch(&msgReq)
+				}
+				if s.pluginRegistry != nil && sess != nil {
+					prependCachedThinking(&msgReq, sess)
+				}
+				return &msgReq, nil
+			}
+			if visProv := s.wrapWithVisual(ctx, openAIReq.Model, candidate, provAdapter, finalizeAnthropicUpstream); visProv != nil {
+				visCoreProvider = visProv
+			}
+		}
+
 		// StreamMessage on ProviderClient returns <-chan any, losing the concrete type.
 		// Get the inner anthropic.Client directly so ToCoreStream receives anthropic.Stream.
 		acc, ok := effectiveProvider.(provider.AnthropicClientAccessor)
@@ -762,59 +813,77 @@ func (s *Server) handleAdapterStream(
 		// This prevents base64 image data from being sent to text-only models.
 		if s.pluginRegistry != nil && s.runtime != nil && openAIReq.Model != "" {
 			cfgV := s.runtime.Current().Config
-			pluginCfg := config.PluginFromGlobalConfig(&cfgV)
-			visCfg, visOk := visualpkg.ConfigForModel(pluginCfg, openAIReq.Model)
+			visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, openAIReq.Model)
 			if visOk && visCfg.Provider != "" && visCfg.Model != "" {
 				strippedReq, _ := visualpkg.StripImagesFromAnthropic(*anthReq)
 				anthReq = &strippedReq
 			}
 		}
-		stream, err := acc.AnthropicClient().StreamMessage(ctx, *anthReq)
-		if err != nil {
-			log.Error("adapter stream: StreamMessage failed", "error", err)
-			payload := openai.ErrorResponse{
-				Error: openai.ErrorObject{
-					Message: fmt.Sprintf("upstream stream error: %v", err),
-					Type:    "server_error",
-					Code:    "provider_error",
-				},
+		if visCoreProvider != nil {
+			coreResp, err := visCoreProvider.CreateCore(ctx, coreReq)
+			if err != nil {
+				log.Error("adapter stream: visual CreateCore failed", "error", err)
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: fmt.Sprintf("visual stream orchestration failed: %v", err),
+						Type:    "server_error",
+						Code:    "provider_error",
+					},
+				}
+				streamRecord.Error = traceError("stream_visual_core", err)
+				streamRecord.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusBadGateway, payload)
+				return
 			}
-			streamRecord.Error = traceError("stream_message", err)
-			streamRecord.OpenAIResponse = payload
-			writeOpenAIError(w, http.StatusBadGateway, payload)
-			return
-		}
-		_ = stream
+			coreEvents = coreResponseToCoreStream(ctx, coreResp)
+		} else {
+			stream, err := acc.AnthropicClient().StreamMessage(ctx, *anthReq)
+			if err != nil {
+				log.Error("adapter stream: StreamMessage failed", "error", err)
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: fmt.Sprintf("upstream stream error: %v", err),
+						Type:    "server_error",
+						Code:    "provider_error",
+					},
+				}
+				streamRecord.Error = traceError("stream_message", err)
+				streamRecord.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusBadGateway, payload)
+				return
+			}
+			_ = stream
 
-		providerStream, ok = s.adapterRegistry.GetProviderStream(config.ProtocolAnthropic)
-		if !ok {
-			log.Warn("adapter stream: no anthropic provider stream adapter")
-			payload := openai.ErrorResponse{
-				Error: openai.ErrorObject{
-					Message: "adapter stream fallback not available",
-					Type:    "server_error",
-					Code:    "adapter_fallback",
-				},
+			providerStream, ok = s.adapterRegistry.GetProviderStream(config.ProtocolAnthropic)
+			if !ok {
+				log.Warn("adapter stream: no anthropic provider stream adapter")
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: "adapter stream fallback not available",
+						Type:    "server_error",
+						Code:    "adapter_fallback",
+					},
+				}
+				streamRecord.Error = traceError("stream_provider_adapter", fmt.Errorf("no anthropic provider stream adapter"))
+				streamRecord.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusInternalServerError, payload)
+				return
 			}
-			streamRecord.Error = traceError("stream_provider_adapter", fmt.Errorf("no anthropic provider stream adapter"))
-			streamRecord.OpenAIResponse = payload
-			writeOpenAIError(w, http.StatusInternalServerError, payload)
-			return
-		}
-		coreEvents, err = providerStream.ToCoreStream(ctx, stream)
-		if err != nil {
-			log.Error("adapter stream: ToCoreStream failed", "error", err)
-			payload := openai.ErrorResponse{
-				Error: openai.ErrorObject{
-					Message: fmt.Sprintf("stream conversion failed: %v", err),
-					Type:    "server_error",
-					Code:    "conversion_error",
-				},
+			coreEvents, err = providerStream.ToCoreStream(ctx, stream)
+			if err != nil {
+				log.Error("adapter stream: ToCoreStream failed", "error", err)
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: fmt.Sprintf("stream conversion failed: %v", err),
+						Type:    "server_error",
+						Code:    "conversion_error",
+					},
+				}
+				streamRecord.Error = traceError("stream_to_core", err)
+				streamRecord.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusInternalServerError, payload)
+				return
 			}
-			streamRecord.Error = traceError("stream_to_core", err)
-			streamRecord.OpenAIResponse = payload
-			writeOpenAIError(w, http.StatusInternalServerError, payload)
-			return
 		}
 
 	case config.ProtocolOpenAIChat:
@@ -839,8 +908,8 @@ func (s *Server) handleAdapterStream(
 			prependCachedReasoningForChat(chatReq, sess)
 		}
 
-		chatClientRaw, ok := s.chatClients[candidate.ProviderKey]
-		if !ok {
+		chatClientRaw := s.activeChatClient(candidate.ProviderKey)
+		if chatClientRaw == nil {
 			log.Error("adapter stream: no chat client", "provider", candidate.ProviderKey)
 			payload := openai.ErrorResponse{
 				Error: openai.ErrorObject{
@@ -856,7 +925,7 @@ func (s *Server) handleAdapterStream(
 		}
 		chatClient, ok := chatClientRaw.(*chat.Client)
 		if !ok {
-			log.Error("adapter stream: chat client type assertion failed", "provider", candidate.ProviderKey)
+			log.Error("adapter stream: invalid chat client type", "provider", candidate.ProviderKey)
 			payload := openai.ErrorResponse{
 				Error: openai.ErrorObject{
 					Message: fmt.Sprintf("invalid chat client for provider %q", candidate.ProviderKey),
@@ -864,7 +933,7 @@ func (s *Server) handleAdapterStream(
 					Code:    "internal_error",
 				},
 			}
-			streamRecord.Error = traceError("stream_chat_type", fmt.Errorf("invalid chat client for %q", candidate.ProviderKey))
+			streamRecord.Error = traceError("stream_chat_client_type", fmt.Errorf("invalid chat client for %q", candidate.ProviderKey))
 			streamRecord.OpenAIResponse = payload
 			writeOpenAIError(w, http.StatusInternalServerError, payload)
 			return
@@ -874,7 +943,8 @@ func (s *Server) handleAdapterStream(
 		var chatStream <-chan chat.ChatStreamChunk
 		var err error
 		if wsInjected {
-			chatStream, err = s.chatSearchBufferedStream(ctx, chatClient, chatReq, s.runtime.Current().Config.TavilyAPIKey, s.runtime.Current().Config.FirecrawlAPIKey, s.maxSearchRounds())
+			searchCfg := s.resolvedSearchConfig(candidate.ProviderKey, openAIReq.Model)
+			chatStream, err = s.chatSearchBufferedStream(ctx, chatClient, chatReq, searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds)
 		} else {
 			chatStream, err = chatClient.StreamChat(ctx, chatReq)
 		}
@@ -941,8 +1011,8 @@ func (s *Server) handleAdapterStream(
 			return
 		}
 
-		googleClientRaw, ok := s.googleClients[candidate.ProviderKey]
-		if !ok {
+		googleClientRaw := s.activeGoogleClient(candidate.ProviderKey)
+		if googleClientRaw == nil {
 			log.Error("adapter stream: no google client", "provider", candidate.ProviderKey)
 			payload := openai.ErrorResponse{
 				Error: openai.ErrorObject{
@@ -958,7 +1028,7 @@ func (s *Server) handleAdapterStream(
 		}
 		googleClient, ok := googleClientRaw.(*google.Client)
 		if !ok {
-			log.Error("adapter stream: google client type assertion failed", "provider", candidate.ProviderKey)
+			log.Error("adapter stream: invalid google client type", "provider", candidate.ProviderKey)
 			payload := openai.ErrorResponse{
 				Error: openai.ErrorObject{
 					Message: fmt.Sprintf("invalid google client for provider %q", candidate.ProviderKey),
@@ -966,13 +1036,81 @@ func (s *Server) handleAdapterStream(
 					Code:    "internal_error",
 				},
 			}
-			streamRecord.Error = traceError("stream_google_type", fmt.Errorf("invalid google client for %q", candidate.ProviderKey))
+			streamRecord.Error = traceError("stream_google_client_type", fmt.Errorf("invalid google client for %q", candidate.ProviderKey))
 			streamRecord.OpenAIResponse = payload
 			writeOpenAIError(w, http.StatusInternalServerError, payload)
 			return
 		}
 
 		streamRecord.UpstreamRequest = googleReq
+		if wsInjected {
+			searchCfg := s.resolvedSearchConfig(candidate.ProviderKey, openAIReq.Model)
+			googleResp, err := s.executeGoogleSearchLoop(ctx, googleClient, candidate.UpstreamModel, googleReq, searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds)
+			if err != nil {
+				log.Error("adapter stream: injected google search loop failed", "error", err)
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: fmt.Sprintf("google stream error: %v", err),
+						Type:    "server_error",
+						Code:    "provider_error",
+					},
+				}
+				streamRecord.Error = traceError("stream_google_injected", err)
+				streamRecord.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusBadGateway, payload)
+				return
+			}
+			streamRecord.UpstreamResponse = googleResp
+			googleProvAdapter, ok := s.adapterRegistry.GetProvider(config.ProtocolGoogleGenAI)
+			if !ok {
+				log.Error("adapter stream: no google provider adapter for injected path")
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: "google stream adapter not available",
+						Type:    "server_error",
+						Code:    "adapter_fallback",
+					},
+				}
+				streamRecord.Error = traceError("stream_google_adapter", fmt.Errorf("no google provider adapter"))
+				streamRecord.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusInternalServerError, payload)
+				return
+			}
+			googleAdapter, ok := googleProvAdapter.(interface {
+				ToCoreResponse(context.Context, any) (*format.CoreResponse, error)
+			})
+			if !ok {
+				log.Error("adapter stream: google adapter lacks ToCoreResponse for injected path")
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: "google stream conversion failed",
+						Type:    "server_error",
+						Code:    "conversion_error",
+					},
+				}
+				streamRecord.Error = traceError("stream_google_injected_type", fmt.Errorf("google adapter type mismatch"))
+				streamRecord.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusInternalServerError, payload)
+				return
+			}
+			coreFinal, convErr := googleAdapter.ToCoreResponse(ctx, googleResp)
+			if convErr != nil {
+				log.Error("adapter stream: injected google ToCoreResponse failed", "error", convErr)
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: fmt.Sprintf("google stream conversion failed: %v", convErr),
+						Type:    "server_error",
+						Code:    "conversion_error",
+					},
+				}
+				streamRecord.Error = traceError("stream_google_injected_tocore", convErr)
+				streamRecord.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusInternalServerError, payload)
+				return
+			}
+			coreEvents = coreResponseToCoreStream(ctx, coreFinal)
+			break
+		}
 		googleStream, err := googleClient.StreamGenerateContent(ctx, candidate.UpstreamModel, googleReq)
 		if err != nil {
 			log.Error("adapter stream: StreamGenerateContent failed", "error", err)
@@ -1109,6 +1247,78 @@ func (s *Server) handleAdapterStream(
 
 	// Record usage statistics after stream completes.
 
+	// Remember reasoning content for DeepSeek thinking replay via StreamInterceptor.
+	// This must not depend on trace being enabled.
+	if s.pluginRegistry != nil && sess != nil {
+		if anthProvider, ok := s.adapterRegistry.GetProvider(config.ProtocolAnthropic); ok {
+			if anthAdapter, ok := anthProvider.(*anthropic.AnthropicProviderAdapter); ok {
+				events := anthAdapter.StreamBuffer()
+				if len(events) > 0 {
+					states := s.pluginRegistry.NewStreamStates(openAIReq.Model)
+					for _, ev := range events {
+						pluginType := ""
+						switch {
+						case ev.Type == "content_block_start":
+							pluginType = "block_start"
+						case ev.Type == "content_block_delta":
+							pluginType = "block_delta"
+						case ev.Type == "content_block_stop":
+							pluginType = "block_stop"
+						}
+						if pluginType == "" {
+							continue
+						}
+						s.pluginRegistry.OnStreamEvent(openAIReq.Model, plugin.StreamEvent{
+							Type:  pluginType,
+							Index: ev.Index,
+							Block: anthropicContentBlockPtrToFormat(ev.ContentBlock),
+							Delta: ev.Delta,
+						}, states)
+					}
+					outputText := ""
+					if finalResp != nil {
+						outputText = finalResp.OutputText
+					}
+					s.pluginRegistry.OnStreamComplete(openAIReq.Model, states, outputText, sess.ExtensionData)
+				}
+			}
+		}
+	}
+
+	// Cache reasoning from Chat stream for DeepSeek thinking replay.
+	// This must not depend on trace being enabled.
+	if sess != nil {
+		if chatProvider, ok := s.adapterRegistry.GetProvider(config.ProtocolOpenAIChat); ok {
+			if chatAdapter, ok := chatProvider.(*chat.ChatProviderAdapter); ok {
+				if events := chatAdapter.StreamBuffer(); len(events) > 0 {
+					var streamReasoning string
+					seenToolCallIDs := make(map[string]struct{})
+					streamToolCallIDs := make([]string, 0, 4)
+					for _, ev := range events {
+						for _, sc := range ev.Choices {
+							if sc.Delta.ReasoningContent != "" {
+								streamReasoning += sc.Delta.ReasoningContent
+							}
+							for _, tc := range sc.Delta.ToolCalls {
+								if tc.ID == "" {
+									continue
+								}
+								if _, ok := seenToolCallIDs[tc.ID]; ok {
+									continue
+								}
+								seenToolCallIDs[tc.ID] = struct{}{}
+								streamToolCallIDs = append(streamToolCallIDs, tc.ID)
+							}
+						}
+					}
+					if streamReasoning != "" && len(streamToolCallIDs) > 0 {
+						cacheReasoningForChat(sess, streamToolCallIDs, streamReasoning)
+					}
+				}
+			}
+		}
+	}
+
 	// Capture stream events for trace.
 	if s.tracer != nil && s.tracer.Enabled() {
 		// OpenAI stream events from client adapter
@@ -1126,68 +1336,11 @@ func (s *Server) handleAdapterStream(
 					streamRecord.AnthropicStreamEvents = events
 				}
 
-				// Remember reasoning content for DeepSeek thinking replay via StreamInterceptor.
-				if anthProvider2, ok := s.adapterRegistry.GetProvider(config.ProtocolAnthropic); ok {
-					if anthAdapter2, ok := anthProvider2.(*anthropic.AnthropicProviderAdapter); ok {
-						if s.pluginRegistry != nil && sess != nil {
-							events := anthAdapter2.StreamBuffer()
-							if len(events) > 0 {
-								states := s.pluginRegistry.NewStreamStates(openAIReq.Model)
-								for _, ev := range events {
-									pluginType := ""
-									switch {
-									case ev.Type == "content_block_start":
-										pluginType = "block_start"
-									case ev.Type == "content_block_delta":
-										pluginType = "block_delta"
-									case ev.Type == "content_block_stop":
-										pluginType = "block_stop"
-									}
-									if pluginType == "" {
-										continue
-									}
-									s.pluginRegistry.OnStreamEvent(openAIReq.Model, plugin.StreamEvent{
-										Type:  pluginType,
-										Index: ev.Index,
-										Block: anthropicContentBlockPtrToFormat(ev.ContentBlock),
-										Delta: ev.Delta,
-									}, states)
-								}
-								outputText := ""
-								if finalResp != nil {
-									outputText = finalResp.OutputText
-								}
-								s.pluginRegistry.OnStreamComplete(openAIReq.Model, states, outputText, sess.ExtensionData)
-							}
-						}
-					}
-				}
 				// Chat stream events from provider adapter
 				if chatProvider, ok := s.adapterRegistry.GetProvider(config.ProtocolOpenAIChat); ok {
 					if chatAdapter, ok := chatProvider.(*chat.ChatProviderAdapter); ok {
 						if events := chatAdapter.StreamBuffer(); len(events) > 0 {
 							streamRecord.ChatStreamEvents = events
-
-							// Cache reasoning from Chat stream for DeepSeek thinking replay.
-							if sess != nil {
-								var streamReasoning string
-								var streamToolCallIDs []string
-								for _, ev := range events {
-									for _, sc := range ev.Choices {
-										if sc.Delta.ReasoningContent != "" {
-											streamReasoning = sc.Delta.ReasoningContent
-										}
-										for _, tc := range sc.Delta.ToolCalls {
-											if tc.ID != "" {
-												streamToolCallIDs = append(streamToolCallIDs, tc.ID)
-											}
-										}
-									}
-								}
-								if streamReasoning != "" && len(streamToolCallIDs) > 0 {
-									cacheReasoningForChat(sess, streamToolCallIDs, streamReasoning)
-								}
-							}
 						}
 					}
 				}
@@ -1222,7 +1375,7 @@ func (s *Server) handleAdapterStream(
 		CacheCreationInputTokens: 0,
 		CacheReadInputTokens:     cachedInput,
 	}
-	reqCost := computeCostWithProviderPricing(s.providerMgr, s.stats, openAIReq.Model, candidate.UpstreamModel, candidate.ProviderKey, billingUsage)
+	reqCost := computeCostWithProviderPricing(pm, s.stats, openAIReq.Model, candidate.UpstreamModel, candidate.ProviderKey, billingUsage)
 	log.Info("流式请求完成",
 		"model", openAIReq.Model,
 		"actual_model", candidate.UpstreamModel,
@@ -1253,7 +1406,7 @@ func (s *Server) handleAdapterStream(
 				CachedInputTokens: finalUsage.InputTokensDetails.CachedTokens,
 			}, true) // input tokens now include cache (normalized at adapter level)
 		}
-		reqCost := computeCostWithProviderPricing(s.providerMgr, s.stats, openAIReq.Model, candidate.UpstreamModel, candidate.ProviderKey, billingUsage)
+		reqCost := computeCostWithProviderPricing(pm, s.stats, openAIReq.Model, candidate.UpstreamModel, candidate.ProviderKey, billingUsage)
 		s.onRequestCompleted(
 			openAIReq.Model, candidate.UpstreamModel, candidate.ProviderKey,
 			requestStart, usage,
@@ -1477,13 +1630,21 @@ func coreBlockHasImage(block format.CoreContentBlock) bool {
 // CoreProvider so the visual orchestrator can operate on format.CoreRequest
 // without knowing the underlying protocol.
 type adapterCoreProvider struct {
-	adapter format.ProviderAdapter
-	client  provider.ProviderClient
-	session *session.Session
+	adapter  format.ProviderAdapter
+	client   provider.ProviderClient
+	finalize func(ctx context.Context, upstream any) (any, error)
 }
 
 func newAdapterCoreProvider(adapter format.ProviderAdapter, client provider.ProviderClient) *adapterCoreProvider {
 	return &adapterCoreProvider{adapter: adapter, client: client}
+}
+
+func newFinalizingAdapterCoreProvider(
+	adapter format.ProviderAdapter,
+	client provider.ProviderClient,
+	finalize func(ctx context.Context, upstream any) (any, error),
+) *adapterCoreProvider {
+	return &adapterCoreProvider{adapter: adapter, client: client, finalize: finalize}
 }
 
 func (p *adapterCoreProvider) CreateCore(ctx context.Context, req *format.CoreRequest) (*format.CoreResponse, error) {
@@ -1491,11 +1652,11 @@ func (p *adapterCoreProvider) CreateCore(ctx context.Context, req *format.CoreRe
 	if err != nil {
 		return nil, err
 	}
-	if msgReq, ok := upstreamAny.(*anthropic.MessageRequest); ok {
-		if p.session != nil {
-			prependCachedThinking(msgReq, p.session)
+	if p.finalize != nil {
+		upstreamAny, err = p.finalize(ctx, upstreamAny)
+		if err != nil {
+			return nil, err
 		}
-		upstreamAny = *msgReq
 	}
 	rawResp, err := p.client.CreateMessage(ctx, upstreamAny)
 	if err != nil {
@@ -1507,6 +1668,180 @@ func (p *adapterCoreProvider) CreateCore(ctx context.Context, req *format.CoreRe
 	return p.adapter.ToCoreResponse(ctx, rawResp)
 }
 
+// coreResponseToCoreStream converts a CoreResponse into a synthetic Core stream.
+// This keeps the stream output contract when a plugin path only provides
+// non-streaming CreateCore semantics.
+func coreResponseToCoreStream(ctx context.Context, resp *format.CoreResponse) <-chan format.CoreStreamEvent {
+	out := make(chan format.CoreStreamEvent)
+	go func() {
+		defer close(out)
+
+		send := func(ev format.CoreStreamEvent) bool {
+			select {
+			case <-ctx.Done():
+				return false
+			case out <- ev:
+				return true
+			}
+		}
+
+		if resp == nil {
+			send(format.CoreStreamEvent{
+				Type:   format.CoreEventFailed,
+				Status: "failed",
+				Error:  &format.CoreError{Message: "nil core response"},
+			})
+			return
+		}
+
+		if !send(format.CoreStreamEvent{
+			Type:   format.CoreEventCreated,
+			Status: "in_progress",
+			Model:  resp.Model,
+			ItemID: resp.ID,
+		}) {
+			return
+		}
+		if !send(format.CoreStreamEvent{
+			Type:   format.CoreEventInProgress,
+			Status: "in_progress",
+			Model:  resp.Model,
+		}) {
+			return
+		}
+
+		blockIndex := 0
+		for _, msg := range resp.Messages {
+			if msg.Role != "assistant" {
+				continue
+			}
+			for _, block := range msg.Content {
+				switch block.Type {
+				case "reasoning":
+					if !send(format.CoreStreamEvent{
+						Type:  format.CoreContentBlockStarted,
+						Index: blockIndex,
+						ContentBlock: &format.CoreContentBlock{
+							Type: "reasoning",
+						},
+					}) {
+						return
+					}
+					if block.ReasoningText != "" {
+						if !send(format.CoreStreamEvent{
+							Type:  format.CoreTextDelta,
+							Index: blockIndex,
+							Delta: block.ReasoningText,
+						}) {
+							return
+						}
+					}
+					if !send(format.CoreStreamEvent{
+						Type:  format.CoreContentBlockDone,
+						Index: blockIndex,
+						ContentBlock: &format.CoreContentBlock{
+							Type:               "reasoning",
+							ReasoningSignature: block.ReasoningSignature,
+						},
+					}) {
+						return
+					}
+				case "tool_use":
+					if !send(format.CoreStreamEvent{
+						Type:  format.CoreContentBlockStarted,
+						Index: blockIndex,
+						ContentBlock: &format.CoreContentBlock{
+							Type:      "tool_use",
+							ToolUseID: block.ToolUseID,
+							ToolName:  block.ToolName,
+						},
+					}) {
+						return
+					}
+					if !send(format.CoreStreamEvent{
+						Type:  format.CoreToolCallArgsDone,
+						Index: blockIndex,
+						Delta: string(block.ToolInput),
+					}) {
+						return
+					}
+					if !send(format.CoreStreamEvent{
+						Type:  format.CoreContentBlockDone,
+						Index: blockIndex,
+					}) {
+						return
+					}
+				default:
+					text := block.Text
+					if block.Type != "text" && text == "" {
+						// Unknown non-text block without textual payload.
+						blockIndex++
+						continue
+					}
+					if !send(format.CoreStreamEvent{
+						Type:  format.CoreContentBlockStarted,
+						Index: blockIndex,
+						ContentBlock: &format.CoreContentBlock{
+							Type: "text",
+						},
+					}) {
+						return
+					}
+					if text != "" {
+						if !send(format.CoreStreamEvent{
+							Type:  format.CoreTextDelta,
+							Index: blockIndex,
+							Delta: text,
+						}) {
+							return
+						}
+					}
+					if !send(format.CoreStreamEvent{
+						Type:  format.CoreContentBlockDone,
+						Index: blockIndex,
+					}) {
+						return
+					}
+				}
+				blockIndex++
+			}
+		}
+
+		usage := resp.Usage
+		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+		status := resp.Status
+		if status == "" {
+			status = "completed"
+		}
+		switch status {
+		case "failed":
+			send(format.CoreStreamEvent{
+				Type:   format.CoreEventFailed,
+				Status: "failed",
+				Model:  resp.Model,
+				Error:  resp.Error,
+			})
+		case "incomplete":
+			send(format.CoreStreamEvent{
+				Type:       format.CoreEventIncomplete,
+				Status:     "incomplete",
+				Model:      resp.Model,
+				StopReason: resp.StopReason,
+				Usage:      &usage,
+			})
+		default:
+			send(format.CoreStreamEvent{
+				Type:       format.CoreEventCompleted,
+				Status:     "completed",
+				Model:      resp.Model,
+				StopReason: resp.StopReason,
+				Usage:      &usage,
+			})
+		}
+	}()
+	return out
+}
+
 // wrapWithVisual returns a CoreProvider that wraps the upstream provider with
 // visual orchestration, or nil when visual is not applicable for this model.
 func (s *Server) wrapWithVisual(
@@ -1514,15 +1849,15 @@ func (s *Server) wrapWithVisual(
 	modelAlias string,
 	preferred provider.ProviderCandidate,
 	providerAdapter format.ProviderAdapter,
-	sess *session.Session,
+	finalizeUpstream func(ctx context.Context, upstream any) (any, error),
 ) visualpkg.CoreProvider {
-	if s.pluginRegistry == nil || s.runtime == nil || modelAlias == "" || s.providerMgr == nil {
+	pm := s.activeProviderManager()
+	if s.pluginRegistry == nil || s.runtime == nil || modelAlias == "" || pm == nil {
 		return nil
 	}
 
 	cfg := s.runtime.Current().Config
-	pluginCfg := config.PluginFromGlobalConfig(&cfg)
-	visCfg, ok := visualpkg.ConfigForModel(pluginCfg, modelAlias)
+	visCfg, ok := visualpkg.ConfigForModelFromResolvedConfig(cfg, modelAlias)
 	if !ok || visCfg.Provider == "" || visCfg.Model == "" {
 		return nil
 	}
@@ -1534,16 +1869,15 @@ func (s *Server) wrapWithVisual(
 	}
 
 	// Upstream CoreProvider = adapter + client.
-	upstreamCP := newAdapterCoreProvider(providerAdapter, effectiveClient)
-	upstreamCP.session = sess
+	upstreamCP := newFinalizingAdapterCoreProvider(providerAdapter, effectiveClient, finalizeUpstream)
 
 	// Visual provider CoreProvider.
-	visClient, err := s.providerMgr.ClientForKey(visCfg.Provider)
+	visClient, err := pm.ClientForKey(visCfg.Provider)
 	if err != nil || visClient == nil {
 		slog.Default().Warn("visual: provider not found", "visual_provider", visCfg.Provider, "model", modelAlias)
 		return nil
 	}
-	visProtocol := s.providerMgr.ProtocolForKey(visCfg.Provider)
+	visProtocol := pm.ProtocolForKey(visCfg.Provider)
 	if visProtocol == "" {
 		slog.Default().Warn("visual: cannot resolve visual provider protocol")
 		return nil
@@ -1558,44 +1892,44 @@ func (s *Server) wrapWithVisual(
 	return visualpkg.NewCoreBridge(upstreamCP, visCP, visCfg.Model, visCfg.MaxRounds, visCfg.MaxTokens)
 }
 
+func normalizeAnthropicRequest(upstream any) (anthropic.MessageRequest, error) {
+	switch v := upstream.(type) {
+	case anthropic.MessageRequest:
+		return v, nil
+	case *anthropic.MessageRequest:
+		if v == nil {
+			return anthropic.MessageRequest{}, fmt.Errorf("expected anthropic.MessageRequest, got nil *anthropic.MessageRequest")
+		}
+		return *v, nil
+	default:
+		return anthropic.MessageRequest{}, fmt.Errorf("expected anthropic.MessageRequest, got %T", upstream)
+	}
+}
+
 // injectCoreWebSearch replaces web_search tools in coreReq.Tools with injected
-// tavily_search/firecrawl_fetch tools when the provider's web search mode is "injected".
+// tavily_search/firecrawl_fetch tools when the resolved web search mode is "injected".
 // Returns true if injection was applied.
-func (s *Server) injectCoreWebSearch(ctx context.Context, coreReq *format.CoreRequest, preferred provider.ProviderCandidate, openAIReq openai.ResponsesRequest) bool {
-	if s.providerMgr == nil {
+func (s *Server) injectCoreWebSearch(ctx context.Context, coreReq *format.CoreRequest, preferred provider.ProviderCandidate, openAIReq openai.ResponsesRequest, wsMode string) bool {
+	_ = ctx
+	if wsMode != "injected" {
 		return false
 	}
-	wsMode := s.providerMgr.ResolvedWebSearch(preferred.ProviderKey)
-	if wsMode != "injected" && wsMode != "auto" {
+	if s.runtime == nil {
 		return false
 	}
-	// For "auto" mode, check if keys are configured (fallback to injected).
-	if wsMode == "auto" && s.runtime != nil {
-		cfg := s.runtime.Current().Config
-		if cfg.TavilyAPIKey == "" && cfg.FirecrawlAPIKey == "" {
-			return false // no keys configured for "auto" fallback
-		}
-	}
-	// Check if the request has a web_search tool.
-	hasWebSearch := false
-	for _, t := range openAIReq.Tools {
-		if t.Type == "web_search" || t.Type == "web_search_preview" {
-			hasWebSearch = true
-			break
-		}
-	}
-	if !hasWebSearch {
+	searchCfg := s.resolvedSearchConfig(preferred.ProviderKey, openAIReq.Model)
+	if searchCfg.tavilyKey == "" && searchCfg.firecrawlKey == "" {
 		return false
 	}
+
 	// Replace coreReq.Tools: keep non-web_search tools, add injected search tools.
 	filtered := make([]format.CoreTool, 0, len(coreReq.Tools)+2)
 	for _, t := range coreReq.Tools {
-		if t.Name != "web_search" {
+		if t.Name != "web_search" && t.Name != "web_search_preview" {
 			filtered = append(filtered, t)
 		}
 	}
-	cfg := s.runtime.Current().Config
-	injected := websearchinjected.CoreTools(cfg.FirecrawlAPIKey)
+	injected := websearchinjected.CoreTools(searchCfg.firecrawlKey)
 	filtered = append(filtered, injected...)
 	coreReq.Tools = filtered
 	// Set tool_choice to auto so the model has freedom to call tavily_search.
@@ -1603,6 +1937,21 @@ func (s *Server) injectCoreWebSearch(ctx context.Context, coreReq *format.CoreRe
 		coreReq.ToolChoice = &format.CoreToolChoice{Mode: "auto"}
 	}
 	return true
+}
+
+func resolvedWebSearchMode(pm *provider.ProviderManager, modelAlias string, preferred provider.ProviderCandidate) string {
+	if pm == nil {
+		return ""
+	}
+	if preferred.ProviderKey != "" && preferred.UpstreamModel != "" {
+		if mode := pm.ResolvedWebSearchForCandidate(preferred.ProviderKey, preferred.UpstreamModel); mode != "" {
+			return mode
+		}
+	}
+	if modelAlias != "" {
+		return pm.ResolvedWebSearchForModel(modelAlias)
+	}
+	return ""
 }
 
 // searchProvider wraps the websearchinjected orchestrator's behavior.
@@ -1661,6 +2010,54 @@ func (a *searchProviderAdapter) StreamMessage(ctx context.Context, req any) (<-c
 
 func (a *searchProviderAdapter) AnthropicClient() *anthropic.Client { return nil }
 
+type searchConfig struct {
+	tavilyKey    string
+	firecrawlKey string
+	maxRounds    int
+}
+
+func (s *Server) resolvedSearchConfig(providerKey, modelAlias string) searchConfig {
+	// Keep a conservative fallback to existing global/runtime behavior.
+	cfg := searchConfig{
+		tavilyKey:    "",
+		firecrawlKey: "",
+		maxRounds:    s.maxSearchRounds(),
+	}
+	if s.runtime == nil {
+		return cfg
+	}
+	fullCfg := s.runtime.Current().Config
+	cfg.tavilyKey = fullCfg.TavilyAPIKey
+	cfg.firecrawlKey = fullCfg.FirecrawlAPIKey
+
+	// Prefer model-level resolved config; then provider-level fallback.
+	if modelAlias != "" {
+		if key := fullCfg.WebSearchTavilyKeyForModel(modelAlias); key != "" {
+			cfg.tavilyKey = key
+		}
+		if key := fullCfg.WebSearchFirecrawlKeyForModel(modelAlias); key != "" {
+			cfg.firecrawlKey = key
+		}
+		if rounds := fullCfg.WebSearchMaxRoundsForModel(modelAlias); rounds > 0 {
+			cfg.maxRounds = rounds
+		}
+		return cfg
+	}
+
+	if providerKey != "" {
+		if key := fullCfg.WebSearchTavilyKeyForProvider(providerKey); key != "" {
+			cfg.tavilyKey = key
+		}
+		if key := fullCfg.WebSearchFirecrawlKeyForProvider(providerKey); key != "" {
+			cfg.firecrawlKey = key
+		}
+		if rounds := fullCfg.WebSearchMaxRoundsForProvider(providerKey); rounds > 0 {
+			cfg.maxRounds = rounds
+		}
+	}
+	return cfg
+}
+
 // injectAnthropicWebSearch adds the Anthropic web_search_20250305 server tool
 // to an anthropic.MessageRequest if not already present.
 func injectAnthropicWebSearch(req *anthropic.MessageRequest) {
@@ -1694,6 +2091,9 @@ func injectAnthropicWebSearch(req *anthropic.MessageRequest) {
 // contains the tool_use, because in follow-up requests the last message
 // is typically a user tool_result.
 func prependCachedThinking(upstreamReq *anthropic.MessageRequest, sess *session.Session) {
+	if upstreamReq == nil || sess == nil || sess.ExtensionData == nil {
+		return
+	}
 	stateRaw, ok := sess.ExtensionData["deepseek_v4"]
 	if !ok {
 		return
@@ -1709,23 +2109,37 @@ func prependCachedThinking(upstreamReq *anthropic.MessageRequest, sess *session.
 		if msg.Role != "assistant" || len(msg.Content) == 0 {
 			continue
 		}
+		// Only tool-call assistant messages require thinking replay fallback.
+		hasToolUse := false
+		for _, block := range msg.Content {
+			if block.Type == "tool_use" {
+				hasToolUse = true
+				break
+			}
+		}
+		if !hasToolUse {
+			continue
+		}
 		// Check if the message already has a thinking block.
 		if hasThinkingBlock(msg.Content) {
 			continue
 		}
 		// Try to prepend cached thinking by tool call ID (for tool_use messages).
+		foundCachedThinking := false
 		for _, block := range msg.Content {
-			if block.Type == "tool_use" && block.ID != "" {
-				if cached, ok := state.CachedForToolCall(block.ID); ok {
-					// Prepend thinking block directly to this message, not to the last message.
-					msg.Content = append([]anthropic.ContentBlock{normalizeThinkingBlock(cached)}, msg.Content...)
-				}
+			if block.Type != "tool_use" || block.ID == "" {
+				continue
+			}
+			if cached, ok := state.CachedForToolCall(block.ID); ok {
+				// Prepend thinking block directly to this message, not to the last message.
+				msg.Content = append([]anthropic.ContentBlock{normalizeThinkingBlock(cached)}, msg.Content...)
+				foundCachedThinking = true
 				break
 			}
 		}
 		// Fallback: prepend empty thinking block as response boundary.
 		// Prevents model from continuing previous response text.
-		if !hasThinkingBlock(msg.Content) {
+		if !foundCachedThinking && !hasThinkingBlock(msg.Content) {
 			prepended, _ := deepseekv4.PrependRequiredThinkingForAssistantText(anthropicContentSliceToFormat(msg.Content))
 			msg.Content = formatContentSliceToAnthropic(prepended)
 		}
@@ -1800,6 +2214,7 @@ func prependCachedReasoningForChat(chatReq *chat.ChatRequest, sess *session.Sess
 		// that the field is present on every assistant message.
 		if msg.ReasoningContent == "" && len(msg.ToolCalls) > 0 {
 			msg.ReasoningContent = ""
+			msg.EmitEmptyReasoningContent = true
 		}
 	}
 }

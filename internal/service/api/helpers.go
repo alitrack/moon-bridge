@@ -49,10 +49,10 @@ func parsePagination(r *http.Request) paginationParams {
 }
 
 type paginatedResponse struct {
-	Data   any    `json:"data"`
-	Total  int    `json:"total"`
-	Limit  int    `json:"limit"`
-	Offset int    `json:"offset"`
+	Data   any `json:"data"`
+	Total  int `json:"total"`
+	Limit  int `json:"limit"`
+	Offset int `json:"offset"`
 }
 
 // ---- Auth middleware ----
@@ -118,6 +118,8 @@ func maskFileConfigSecrets(fc *config.FileConfig) {
 		def.WebSearch = ws
 		fc.Providers[key] = def
 	}
+
+	fc.Server.AuthToken = maskAPIKey(fc.Server.AuthToken)
 
 	fc.Proxy.Response.APIKey = maskAPIKey(fc.Proxy.Response.APIKey)
 	fc.Proxy.Anthropic.APIKey = maskAPIKey(fc.Proxy.Anthropic.APIKey)

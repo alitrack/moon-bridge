@@ -63,6 +63,12 @@ func TestSQLiteStoreSeedLoadRoundtrip(t *testing.T) {
 	if cfg.AuthToken != cfg2.AuthToken {
 		t.Fatalf("AuthToken: got %q, want %q", cfg2.AuthToken, cfg.AuthToken)
 	}
+	if cfg.MaxSessions != cfg2.MaxSessions {
+		t.Fatalf("MaxSessions: got %d, want %d", cfg2.MaxSessions, cfg.MaxSessions)
+	}
+	if cfg.SessionTTL != cfg2.SessionTTL {
+		t.Fatalf("SessionTTL: got %q, want %q", cfg2.SessionTTL, cfg.SessionTTL)
+	}
 	if cfg.Defaults.Model != cfg2.Defaults.Model {
 		t.Fatalf("Defaults.Model: got %q, want %q", cfg2.Defaults.Model, cfg.Defaults.Model)
 	}
@@ -219,6 +225,8 @@ func buildTestConfig() *config.Config {
 		Mode:             config.ModeTransform,
 		Addr:             "127.0.0.1:38440",
 		AuthToken:        "test-token",
+		MaxSessions:      42,
+		SessionTTL:       "36h",
 		TraceRequests:    true,
 		LogLevel:         "debug",
 		LogFormat:        "json",
@@ -282,8 +290,8 @@ func buildTestConfig() *config.Config {
 		},
 		Routes: map[string]config.RouteEntry{
 			"moonbridge": {
-				Provider:   "anthropic",
-				Model:      "claude-sonnet-4-20250514",
+				Provider:    "anthropic",
+				Model:       "claude-sonnet-4-20250514",
 				DisplayName: "Moonbridge Sonnet",
 			},
 			"fast": {
@@ -542,7 +550,6 @@ func TestSQLiteStoreApplyProviderCreateAndDelete(t *testing.T) {
 		t.Fatal("new provider should have been deleted")
 	}
 }
-
 
 func contains(s, substr string) bool {
 	return strings.Contains(s, substr)

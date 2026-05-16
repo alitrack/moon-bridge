@@ -6,8 +6,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"sync"
 	"sort"
+	"sync"
 	"time"
 
 	"moonbridge/internal/config"
@@ -27,16 +27,16 @@ type ModelMeta = config.ModelMeta
 
 // ProviderConfig defines how to connect to a single upstream provider.
 type ProviderConfig struct {
-	BaseURL          string                 `yaml:"base_url"`
-	APIKey           string                 `yaml:"api_key"`
-	Version          string                 `yaml:"version"`
-	UserAgent        string                 `yaml:"user_agent"`
-	Protocol         string                 // "anthropic" (default) or "openai-response"
-	HTTP             HTTPConfig             `yaml:"http"`
-	WebSearchSupport string                 // "auto", "enabled", "disabled", "injected", or "" (inherit global)
-	ModelNames       []string               // upstream model names for this provider
-	Models           map[string]ModelMeta   // full model metadata (upstream name -> meta) [deprecated: use Offers]
-	Offers           []config.OfferEntry    // model offerings with pricing (replaces Models)
+	BaseURL          string               `yaml:"base_url"`
+	APIKey           string               `yaml:"api_key"`
+	Version          string               `yaml:"version"`
+	UserAgent        string               `yaml:"user_agent"`
+	Protocol         string               // "anthropic" (default) or "openai-response"
+	HTTP             HTTPConfig           `yaml:"http"`
+	WebSearchSupport string               // "auto", "enabled", "disabled", "injected", or "" (inherit global)
+	ModelNames       []string             // upstream model names for this provider
+	Models           map[string]ModelMeta // full model metadata (upstream name -> meta) [deprecated: use Offers]
+	Offers           []config.OfferEntry  // model offerings with pricing (replaces Models)
 }
 
 // modelProviderEntry is a reverse-index entry: provider key + offer priority.
@@ -51,13 +51,12 @@ type ModelRoute struct {
 	Name     string `yaml:"name"`     // upstream model name
 }
 
-
 // ProviderCandidate represents a candidate provider for a resolved model.
 type ProviderCandidate struct {
 	ProviderKey   string
 	UpstreamModel string
 	Protocol      string // "anthropic" | "openai-response"
-	Client ProviderClient
+	Client        ProviderClient
 }
 
 // ResolvedRoute contains the result of model resolution.
@@ -81,18 +80,32 @@ type anthropicClientAdapter struct {
 	client *anthropic.Client
 }
 
+func normalizeAnthropicMessageRequest(req any) (anthropic.MessageRequest, error) {
+	switch v := req.(type) {
+	case anthropic.MessageRequest:
+		return v, nil
+	case *anthropic.MessageRequest:
+		if v == nil {
+			return anthropic.MessageRequest{}, fmt.Errorf("expected anthropic.MessageRequest, got nil *anthropic.MessageRequest")
+		}
+		return *v, nil
+	default:
+		return anthropic.MessageRequest{}, fmt.Errorf("expected anthropic.MessageRequest, got %T", req)
+	}
+}
+
 func (a *anthropicClientAdapter) CreateMessage(ctx context.Context, req any) (any, error) {
-	msgReq, ok := req.(anthropic.MessageRequest)
-	if !ok {
-		return nil, fmt.Errorf("expected anthropic.MessageRequest, got %T", req)
+	msgReq, err := normalizeAnthropicMessageRequest(req)
+	if err != nil {
+		return nil, err
 	}
 	return a.client.CreateMessage(ctx, msgReq)
 }
 
 func (a *anthropicClientAdapter) StreamMessage(ctx context.Context, req any) (<-chan any, error) {
-	msgReq, ok := req.(anthropic.MessageRequest)
-	if !ok {
-		return nil, fmt.Errorf("expected anthropic.MessageRequest, got %T", req)
+	msgReq, err := normalizeAnthropicMessageRequest(req)
+	if err != nil {
+		return nil, err
 	}
 	stream, err := a.client.StreamMessage(ctx, msgReq)
 	if err != nil {
@@ -121,15 +134,13 @@ func NewAnthropicClientAdapter(client *anthropic.Client) ProviderClient {
 	return &anthropicClientAdapter{client: client}
 }
 
-
-
 type ProviderManager struct {
-	mu        sync.Mutex               // guards field replacement during Reload
-	clients    map[string]ProviderClient
-	providers  map[string]ProviderConfig    // provider key -> config (for inspection)
-	routes     map[string]ModelRoute        // model alias -> route
-	defaultK   string                       // default provider key
-	resolvedWS map[string]string            // provider key -> resolved web search support
+	mu             sync.Mutex // guards field replacement during Reload
+	clients        map[string]ProviderClient
+	providers      map[string]ProviderConfig       // provider key -> config (for inspection)
+	routes         map[string]ModelRoute           // model alias -> route
+	defaultK       string                          // default provider key
+	resolvedWS     map[string]string               // provider key -> resolved web search support
 	modelProviders map[string][]modelProviderEntry // upstream model name -> (provider key, priority) (reverse index)
 }
 
@@ -294,9 +305,10 @@ func (pm *ProviderManager) ClientFor(modelAlias string) (string, ProviderClient,
 
 // ResolveModel resolves a model name to a ResolvedRoute with candidate providers.
 // Priority:
-//	1. Route alias (explicit routes map)
-//	2. Direct ref (provider/model or model(provider))
-//	3. Dynamic model (reverse index from provider catalog ModelNames)
+//  1. Route alias (explicit routes map)
+//  2. Direct ref (provider/model or model(provider))
+//  3. Dynamic model (reverse index from provider catalog ModelNames)
+//
 // Returns error if no candidates are found.
 func (pm *ProviderManager) ResolveModel(modelName string) (*ResolvedRoute, error) {
 	// 1. Route alias (highest priority)
@@ -337,16 +349,16 @@ func (pm *ProviderManager) ResolveModel(modelName string) (*ResolvedRoute, error
 
 	// 3. Dynamic model: look up reverse index (provider catalog)
 	if providerEntries, ok := pm.modelProviders[modelName]; ok && len(providerEntries) > 0 {
-			sorted := make([]modelProviderEntry, len(providerEntries))
-			copy(sorted, providerEntries)
-			sort.Slice(sorted, func(i, j int) bool {
-				pi := sorted[i].priority
-				pj := sorted[j].priority
-				if pi != pj {
-					return pi < pj // lower priority = higher precedence (0 is highest)
-				}
-				return sorted[i].providerKey < sorted[j].providerKey // tiebreaker: provider key dictionary order
-			})
+		sorted := make([]modelProviderEntry, len(providerEntries))
+		copy(sorted, providerEntries)
+		sort.Slice(sorted, func(i, j int) bool {
+			pi := sorted[i].priority
+			pj := sorted[j].priority
+			if pi != pj {
+				return pi < pj // lower priority = higher precedence (0 is highest)
+			}
+			return sorted[i].providerKey < sorted[j].providerKey // tiebreaker: provider key dictionary order
+		})
 
 		candidates := make([]ProviderCandidate, 0, len(sorted))
 		for _, entry := range sorted {
@@ -380,6 +392,25 @@ func (pm *ProviderManager) ProbeWebSearch(ctx context.Context, modelAlias string
 	accessor, ok := client.(AnthropicClientAccessor)
 	if !ok {
 		return false, fmt.Errorf("provider client for %q does not support web search probing", modelAlias)
+	}
+	return accessor.AnthropicClient().ProbeWebSearch(ctx, upstreamModel)
+}
+
+// ProbeWebSearchCandidate probes web_search support for a specific provider/model pair.
+func (pm *ProviderManager) ProbeWebSearchCandidate(ctx context.Context, providerKey, upstreamModel string) (bool, error) {
+	if providerKey == "" {
+		return false, fmt.Errorf("provider key is required")
+	}
+	if upstreamModel == "" {
+		return false, fmt.Errorf("upstream model is required")
+	}
+	client, err := pm.ClientForKey(providerKey)
+	if err != nil {
+		return false, err
+	}
+	accessor, ok := client.(AnthropicClientAccessor)
+	if !ok {
+		return false, fmt.Errorf("provider client for %q does not support web search probing", providerKey)
 	}
 	return accessor.AnthropicClient().ProbeWebSearch(ctx, upstreamModel)
 }
@@ -421,8 +452,6 @@ func newHTTPClient(cfg HTTPConfig) *http.Client {
 		},
 	}
 }
-
-
 
 func valueOrDefault(value, fallback string) string {
 	if value == "" {
@@ -523,6 +552,11 @@ func (pm *ProviderManager) ProviderKeyForModel(modelAlias string) string {
 	return route.Provider
 }
 
+// WebSearchCandidateKey returns the runtime key for a resolved provider/model pair.
+func WebSearchCandidateKey(providerKey, upstreamModel string) string {
+	return "candidate:" + providerKey + "/" + upstreamModel
+}
+
 // SetResolvedWebSearch stores the resolved web search support for a provider key.
 // Also accepts model aliases for per-model resolution.
 func (pm *ProviderManager) SetResolvedWebSearch(key string, support string) {
@@ -561,8 +595,27 @@ func (pm *ProviderManager) ResolvedWebSearchForModel(modelAlias string) string {
 	if v, ok := pm.resolvedWS["model:"+modelAlias]; ok {
 		return v
 	}
+	if providerKey, upstreamModel, ok := pm.ProviderAndUpstreamForModel(modelAlias); ok {
+		if v, ok := pm.resolvedWS[WebSearchCandidateKey(providerKey, upstreamModel)]; ok {
+			return v
+		}
+	}
 	// Fall back to provider-level.
 	return pm.resolvedWS[pm.ProviderKeyForModel(modelAlias)]
+}
+
+// ResolvedWebSearchForCandidate returns the resolved web search support for a provider/model pair.
+// Falls back to provider-level support when no candidate-specific resolution exists.
+func (pm *ProviderManager) ResolvedWebSearchForCandidate(providerKey, upstreamModel string) string {
+	if providerKey == "" {
+		return ""
+	}
+	if upstreamModel != "" {
+		if v, ok := pm.resolvedWS[WebSearchCandidateKey(providerKey, upstreamModel)]; ok {
+			return v
+		}
+	}
+	return pm.resolvedWS[providerKey]
 }
 
 // WebSearchConfigForKey returns the configured web search support for a provider key.
@@ -593,6 +646,27 @@ func (pm *ProviderManager) FirstUpstreamModelForKey(key string) string {
 		return cfg.ModelNames[0]
 	}
 	return ""
+}
+
+// ProviderAndUpstreamForModel resolves the provider key and upstream model for a model alias.
+func (pm *ProviderManager) ProviderAndUpstreamForModel(modelAlias string) (providerKey string, upstreamModel string, ok bool) {
+	// Direct provider/model reference.
+	if provider, upstream := ParseModelRef(modelAlias); provider != "" {
+		if _, exists := pm.clients[provider]; exists {
+			return provider, upstream, true
+		}
+	}
+	if route, exists := pm.routes[modelAlias]; exists {
+		providerKey = route.Provider
+		if providerKey == "" {
+			providerKey = pm.defaultK
+		}
+		return providerKey, route.Name, true
+	}
+	if pm.defaultK == "" {
+		return "", "", false
+	}
+	return pm.defaultK, modelAlias, true
 }
 
 // ParseModelRef parses a model reference that may be in "provider/model" or "model(provider)" format.

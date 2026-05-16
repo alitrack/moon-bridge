@@ -34,9 +34,10 @@ type PluginContext struct {
 	// Config is the decoded typed config struct for the plugin, or nil if
 	// the plugin has not registered a config type. Populated by Registry.InitAll.
 	// Use plugin.Config[T](ctx) to retrieve a typed struct.
-	Config    any
-	AppConfig config.Config // read-only global config
-	Logger    *slog.Logger  // logger prefixed with the plugin name
+	Config        any
+	AppConfig     config.Config // read-only init-time config snapshot
+	CurrentConfig func() config.Config
+	Logger        *slog.Logger // logger prefixed with the plugin name
 }
 
 // ConfigSpecProvider lets plugins declare extension-owned configuration across

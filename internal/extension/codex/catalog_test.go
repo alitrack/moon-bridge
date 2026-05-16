@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"moonbridge/internal/extension/codex"
 	"moonbridge/internal/config"
+	"moonbridge/internal/extension/codex"
+	"moonbridge/internal/extension/visual"
 )
 
 func TestBuildModelInfoFromRouteEnablesApplyPatchFreeform(t *testing.T) {
@@ -85,7 +87,7 @@ func TestGenerateConfigTomlDoesNotSetServiceTier(t *testing.T) {
 	}
 	var output bytes.Buffer
 	err := codex.GenerateConfigToml(&output, "moonbridge", "http://127.0.0.1:38440/v1", "",
-		config.ProviderFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
+		config.ProviderFromGlobalConfig(&cfg), config.PluginFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
 	if err != nil {
 		t.Fatalf("GenerateConfigToml() error = %v", err)
 	}
@@ -116,7 +118,7 @@ func TestGenerateConfigTomlIncludesDeepWikiMCPServer(t *testing.T) {
 	}
 	var output bytes.Buffer
 	err := codex.GenerateConfigToml(&output, "test", "http://127.0.0.1:38440/v1", "",
-		config.ProviderFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
+		config.ProviderFromGlobalConfig(&cfg), config.PluginFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
 	if err != nil {
 		t.Fatalf("GenerateConfigToml() error = %v", err)
 	}
@@ -125,7 +127,6 @@ func TestGenerateConfigTomlIncludesDeepWikiMCPServer(t *testing.T) {
 		t.Fatalf("missing deepwiki MCP server in generated config:\n%s", generated)
 	}
 }
-
 
 func TestBuildModelInfosFromConfig_DeduplicatesSameModelAcrossProviders(t *testing.T) {
 	cfg := config.Config{
@@ -279,11 +280,11 @@ func TestBuildModelInfosFromConfig_ReasoningLevelsDeduplicatedByEffort(t *testin
 	}
 	// Low from preferred provider.
 	if levels[1].Effort != "low" || levels[1].Description != "A Low" {
-	t.Fatalf("levels[1] = %+v, want effort=low description=A Low", levels[1])
+		t.Fatalf("levels[1] = %+v, want effort=low description=A Low", levels[1])
 	}
 	// Xhigh should come from provider-b since it's a new effort.
 	if levels[2].Effort != "xhigh" || levels[2].Description != "B XHigh" {
-	t.Fatalf("levels[2] = %+v, want effort=xhigh description=B XHigh", levels[2])
+		t.Fatalf("levels[2] = %+v, want effort=xhigh description=B XHigh", levels[2])
 	}
 }
 func TestGenerateConfigTomlNormalizesDirectProviderModelRef(t *testing.T) {
@@ -301,7 +302,7 @@ func TestGenerateConfigTomlNormalizesDirectProviderModelRef(t *testing.T) {
 	}
 	// No route for "deepseek/deepseek-v4-pro" — it is a direct provider/model reference.
 	err := codex.GenerateConfigToml(&output, "deepseek/deepseek-v4-pro", "http://127.0.0.1:38440/v1", "",
-		config.ProviderFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
+		config.ProviderFromGlobalConfig(&cfg), config.PluginFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
 	if err != nil {
 		t.Fatalf("GenerateConfigToml() error = %v", err)
 	}
@@ -331,7 +332,7 @@ func TestGenerateConfigTomlModelProviderFormatInputStable(t *testing.T) {
 	}
 	// Input already in model(provider) format — should remain unchanged.
 	err := codex.GenerateConfigToml(&output, "deepseek-v4-pro(deepseek)", "http://127.0.0.1:38440/v1", "",
-		config.ProviderFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
+		config.ProviderFromGlobalConfig(&cfg), config.PluginFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
 	if err != nil {
 		t.Fatalf("GenerateConfigToml() error = %v", err)
 	}
@@ -359,7 +360,7 @@ func TestGenerateConfigTomlRouteAliasWithSlashNotNormalized(t *testing.T) {
 	}
 	// p1/model-a is an explicit route alias — should NOT be normalized.
 	err := codex.GenerateConfigToml(&output, "p1/model-a", "http://127.0.0.1:38440/v1", "",
-		config.ProviderFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
+		config.ProviderFromGlobalConfig(&cfg), config.PluginFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
 	if err != nil {
 		t.Fatalf("GenerateConfigToml() error = %v", err)
 	}
@@ -384,7 +385,7 @@ func TestGenerateConfigTomlCodexHomeContainsNormalizedSlug(t *testing.T) {
 		},
 	}
 	err := codex.GenerateConfigToml(&output, "deepseek/deepseek-v4-pro", "http://127.0.0.1:38440/v1", codexHome,
-		config.ProviderFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
+		config.ProviderFromGlobalConfig(&cfg), config.PluginFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
 	if err != nil {
 		t.Fatalf("GenerateConfigToml() error = %v", err)
 	}
@@ -402,7 +403,6 @@ func TestGenerateConfigTomlCodexHomeContainsNormalizedSlug(t *testing.T) {
 		t.Fatalf("config missing normalized model slug:\n%s", generated)
 	}
 }
-
 
 func TestWriteModelsCatalogProducesValidJSON(t *testing.T) {
 	dir := t.TempDir()
@@ -436,6 +436,86 @@ func TestWriteModelsCatalogProducesValidJSON(t *testing.T) {
 	}
 	if len(result.Models) == 0 {
 		t.Fatal("expected at least 1 model in catalog")
+	}
+}
+
+func TestGenerateConfigTomlCatalogIncludesVisualInjectedImageModality(t *testing.T) {
+	enabled := true
+	codexHome := t.TempDir()
+	var output bytes.Buffer
+	cfg := config.Config{
+		Models: map[string]config.ModelDef{
+			"gpt-text": {InputModalities: []string{"text"}},
+		},
+		ProviderDefs: map[string]config.ProviderDef{
+			"openai": {
+				Offers: []config.OfferEntry{{Model: "gpt-text"}},
+			},
+		},
+		Routes: map[string]config.RouteEntry{
+			"text-route": {Provider: "openai", Model: "gpt-text"},
+		},
+		Extensions: map[string]config.ExtensionSettings{
+			visual.PluginName: {Enabled: &enabled},
+		},
+	}
+
+	err := codex.GenerateConfigToml(&output, "text-route", "http://127.0.0.1:38440/v1", codexHome,
+		config.ProviderFromGlobalConfig(&cfg), config.PluginFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
+	if err != nil {
+		t.Fatalf("GenerateConfigToml() error = %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(codexHome, "models_catalog.json"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+
+	var result struct {
+		Models []codex.ModelInfo `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("JSON unmarshal error = %v", err)
+	}
+	if len(result.Models) != 2 {
+		t.Fatalf("expected provider model plus route alias, got %d", len(result.Models))
+	}
+	for _, model := range result.Models {
+		hasImage := false
+		for _, mod := range model.InputModalities {
+			if mod == "image" {
+				hasImage = true
+				break
+			}
+		}
+		if !hasImage {
+			t.Fatalf("model %q missing injected image modality: %v", model.Slug, model.InputModalities)
+		}
+	}
+}
+
+func TestGenerateConfigTomlWritesAuthJSONWithOwnerOnlyPermissions(t *testing.T) {
+	codexHome := t.TempDir()
+	var output bytes.Buffer
+	cfg := config.Config{
+		Routes: map[string]config.RouteEntry{
+			"secure": {Provider: "openai", Model: "gpt-4o"},
+		},
+		AuthToken: "secret-token",
+	}
+
+	err := codex.GenerateConfigToml(&output, "secure", "http://127.0.0.1:38440/v1", codexHome,
+		config.ProviderFromGlobalConfig(&cfg), config.PluginFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
+	if err != nil {
+		t.Fatalf("GenerateConfigToml() error = %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Fatalf("auth.json perm = %04o, want 0600", perm)
 	}
 }
 

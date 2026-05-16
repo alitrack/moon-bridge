@@ -9,11 +9,13 @@ import (
 	"sync"
 	"time"
 
-	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/config"
-	"moonbridge/internal/logger"
-	"moonbridge/internal/protocol/openai"
+	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/format"
+	"moonbridge/internal/logger"
+	"moonbridge/internal/protocol/chat"
+	"moonbridge/internal/protocol/google"
+	"moonbridge/internal/protocol/openai"
 	"moonbridge/internal/service/api"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/runtime"
@@ -32,48 +34,95 @@ import (
 type Config struct {
 	// ServerCfg is the scoped domain config for the server layer.
 	// Used alongside AppConfig for the full config.
-	ServerCfg config.ServerConfig
-	AdapterRegistry   *format.Registry    // adapter dispatch path (format registry)
-	Provider          provider.ProviderClient // fallback provider for non-adapter path
-	ProviderMgr       *provider.ProviderManager
-	OpenAIHTTPClient  *http.Client
-	ChatClients       map[string]any
-	GoogleClients     map[string]any
-	Tracer            *mbtrace.Tracer
-	TraceErrors       io.Writer
-	Stats             *stats.SessionStats
-	PluginRegistry    *plugin.Registry
-	AppConfig         config.ServerConfig
-	Runtime           *runtime.Runtime
-	Store             store.ConfigStore
-	SessionManager    session.Manager
-	UsageTracker      usage.Tracker
-	TraceWriter       trace.Writer
+	ServerCfg        config.ServerConfig
+	AdapterRegistry  *format.Registry        // adapter dispatch path (format registry)
+	Provider         provider.ProviderClient // fallback provider for non-adapter path
+	ProviderMgr      *provider.ProviderManager
+	OpenAIHTTPClient *http.Client
+	ChatClients      map[string]any
+	GoogleClients    map[string]any
+	Tracer           *mbtrace.Tracer
+	TraceErrors      io.Writer
+	Stats            *stats.SessionStats
+	PluginRegistry   *plugin.Registry
+	AppConfig        config.ServerConfig
+	Runtime          *runtime.Runtime
+	Store            store.ConfigStore
+	SessionManager   session.Manager
+	UsageTracker     usage.Tracker
+	TraceWriter      trace.Writer
 }
 
 type Server struct {
-	adapterRegistry   *format.Registry
-	provider          provider.ProviderClient
-	providerMgr       *provider.ProviderManager
-	openAIHTTP        *http.Client
-	chatClients       map[string]any
-	googleClients     map[string]any
-	tracer            *mbtrace.Tracer
-	traceErrors       io.Writer
-	stats             *stats.SessionStats
-	pluginRegistry    *plugin.Registry
-	mux               *http.ServeMux
-	sessionsMu        sync.Mutex
-	sessions          map[string]serverSession
-	sessionPruneStop  chan struct{}
-	onceClose         sync.Once
-	appConfig         config.ServerConfig
-	serverCfg         config.ServerConfig
-	runtime           *runtime.Runtime
-	store             store.ConfigStore
-	sessionManager    session.Manager
-	usageTracker      usage.Tracker
-	traceWriter       trace.Writer
+	adapterRegistry *format.Registry
+	provider        provider.ProviderClient
+	providerMgr     *provider.ProviderManager
+	openAIHTTP      *http.Client
+	chatClients     map[string]any
+	googleClients   map[string]any
+	tracer          *mbtrace.Tracer
+	traceErrors     io.Writer
+	stats           *stats.SessionStats
+	pluginRegistry  *plugin.Registry
+	mux             *http.ServeMux
+	onceClose       sync.Once
+	appConfig       config.ServerConfig
+	serverCfg       config.ServerConfig
+	runtime         *runtime.Runtime
+	store           store.ConfigStore
+	sessionManager  session.Manager
+	usageTracker    usage.Tracker
+	traceWriter     trace.Writer
+}
+
+func (s *Server) runtimeSnapshot() *runtime.ConfigSnapshot {
+	if s.runtime == nil {
+		return nil
+	}
+	return s.runtime.Current()
+}
+
+func (s *Server) activeProviderManager() *provider.ProviderManager {
+	if snap := s.runtimeSnapshot(); snap != nil && snap.ProviderMgr != nil {
+		return snap.ProviderMgr
+	}
+	return s.providerMgr
+}
+
+func (s *Server) activeProviderDefs() map[string]config.ProviderDef {
+	if snap := s.runtimeSnapshot(); snap != nil {
+		return snap.Config.ProviderDefs
+	}
+	return nil
+}
+
+func (s *Server) activeChatClient(providerKey string) any {
+	if snap := s.runtimeSnapshot(); snap != nil {
+		if def, ok := snap.Config.ProviderDefs[providerKey]; ok && def.Protocol == config.ProtocolOpenAIChat {
+			return chat.NewClient(chat.ClientConfig{
+				BaseURL:   def.BaseURL,
+				APIKey:    def.APIKey,
+				UserAgent: def.UserAgent,
+			})
+		}
+	}
+	return s.chatClients[providerKey]
+}
+
+func (s *Server) activeGoogleClient(providerKey string) any {
+	if snap := s.runtimeSnapshot(); snap != nil {
+		if def, ok := snap.Config.ProviderDefs[providerKey]; ok && def.Protocol == config.ProtocolGoogleGenAI {
+			return google.NewClient(google.ClientConfig{
+				BaseURL:   def.BaseURL,
+				APIKey:    def.APIKey,
+				Project:   def.Project,
+				Location:  def.Location,
+				Version:   def.APIVersion,
+				UserAgent: def.UserAgent,
+			})
+		}
+	}
+	return s.googleClients[providerKey]
 }
 
 func New(cfg Config) *Server {
@@ -81,32 +130,29 @@ func New(cfg Config) *Server {
 		cfg.SessionManager = newDefaultSessionManager(cfg)
 	}
 	s := &Server{
-		adapterRegistry:  cfg.AdapterRegistry,
-		provider:         cfg.Provider,
-		providerMgr:      cfg.ProviderMgr,
-		openAIHTTP:       cfg.OpenAIHTTPClient,
-		tracer:           cfg.Tracer,
-		traceErrors:      cfg.TraceErrors,
-		stats:            cfg.Stats,
-		pluginRegistry:   cfg.PluginRegistry,
-		mux:              http.NewServeMux(),
-		sessions:         map[string]serverSession{},
-		sessionPruneStop: make(chan struct{}),
-	appConfig:        cfg.AppConfig,
-	serverCfg:        cfg.ServerCfg,
-	chatClients:      cfg.ChatClients,
-		googleClients:    cfg.GoogleClients,
-		runtime:          cfg.Runtime,
-		store:            cfg.Store,
-		sessionManager:   cfg.SessionManager,
-		usageTracker:     cfg.UsageTracker,
-		traceWriter:      cfg.TraceWriter,
+		adapterRegistry: cfg.AdapterRegistry,
+		provider:        cfg.Provider,
+		providerMgr:     cfg.ProviderMgr,
+		openAIHTTP:      cfg.OpenAIHTTPClient,
+		tracer:          cfg.Tracer,
+		traceErrors:     cfg.TraceErrors,
+		stats:           cfg.Stats,
+		pluginRegistry:  cfg.PluginRegistry,
+		mux:             http.NewServeMux(),
+		appConfig:       cfg.AppConfig,
+		serverCfg:       cfg.ServerCfg,
+		chatClients:     cfg.ChatClients,
+		googleClients:   cfg.GoogleClients,
+		runtime:         cfg.Runtime,
+		store:           cfg.Store,
+		sessionManager:  cfg.SessionManager,
+		usageTracker:    cfg.UsageTracker,
+		traceWriter:     cfg.TraceWriter,
 	}
 	s.mux.HandleFunc("/v1/responses", s.handleResponses)
 	s.mux.HandleFunc("/responses", s.handleResponses)
 	s.mux.HandleFunc("/v1/models", s.handleModels)
 	s.mux.HandleFunc("/models", s.handleModels)
-	go s.startSessionPruning()
 	s.registerPluginRoutes()
 	if cfg.Runtime != nil && cfg.Store != nil {
 		apiRouter := api.NewRouter(s.store, s.runtime, s.stats, s.pluginRegistry, s)
@@ -192,6 +238,9 @@ func (s *Server) listModels() []map[string]any {
 }
 
 func (s *Server) currentConfig() config.ServerConfig {
+	if snap := s.runtimeSnapshot(); snap != nil {
+		return config.ServerFromGlobalConfig(&snap.Config)
+	}
 	return s.serverCfg
 }
 
@@ -229,7 +278,6 @@ func (s *Server) Close() error {
 		if s.sessionManager != nil {
 			s.sessionManager.Stop()
 		}
-		close(s.sessionPruneStop)
 	})
 	return nil
 }
@@ -256,8 +304,6 @@ func computeCostWithProviderPricing(pm *provider.ProviderManager, stats *stats.S
 	return stats.ComputeBillingCost(requestModel, usage)
 }
 
-
-
 // slugDisplayName converts a route alias slug to a human-readable display name.
 // e.g. "gpt-5.4" -> "GPT 5.4", "codex-auto-review" -> "Codex Auto Review"
 func slugDisplayName(slug string) string {
@@ -283,8 +329,8 @@ func checkAuth(r *http.Request, expectedToken string) bool {
 }
 
 func (s *Server) resolveModelOrFallback(modelName string) (*provider.ResolvedRoute, error) {
-	if s.providerMgr != nil {
-		return s.providerMgr.ResolveModel(modelName)
+	if pm := s.activeProviderManager(); pm != nil {
+		return pm.ResolveModel(modelName)
 	}
 	if s.provider != nil {
 		return &provider.ResolvedRoute{
@@ -319,7 +365,8 @@ func requestHasImage(input json.RawMessage) bool {
 }
 
 func (s *Server) filterCandidatesByInput(candidates []provider.ProviderCandidate, input json.RawMessage) ([]provider.ProviderCandidate, string) {
-	if s.providerMgr == nil {
+	pm := s.activeProviderManager()
+	if pm == nil {
 		return candidates, ""
 	}
 	hasImage := requestHasImage(input)
@@ -329,7 +376,7 @@ func (s *Server) filterCandidatesByInput(candidates []provider.ProviderCandidate
 	filtered := make([]provider.ProviderCandidate, 0, len(candidates))
 	removedCount := 0
 	for _, c := range candidates {
-		meta, ok := s.providerMgr.ModelMetaFor(c.UpstreamModel, c.ProviderKey)
+		meta, ok := pm.ModelMetaFor(c.UpstreamModel, c.ProviderKey)
 		if !ok || !hasModalityImage(meta.InputModalities) {
 			removedCount++
 			logger.L().Debug("过滤掉不支持图片的提供商候选", "provider", c.ProviderKey, "model", c.UpstreamModel)
@@ -354,15 +401,26 @@ func hasModalityImage(modalities []string) bool {
 }
 
 func newDefaultSessionManager(cfg Config) session.Manager {
-	return session.NewInMemoryManager(&sessionConfigAdapter{serverCfg: cfg.AppConfig}, cfg.PluginRegistry)
+	return session.NewInMemoryManager(&sessionConfigAdapter{runtime: cfg.Runtime, fallback: cfg.AppConfig}, cfg.PluginRegistry)
 }
 
 type sessionConfigAdapter struct {
-	serverCfg config.ServerConfig
+	runtime  *runtime.Runtime
+	fallback config.ServerConfig
+}
+
+func (a *sessionConfigAdapter) currentServerConfig() config.ServerConfig {
+	if a.runtime != nil {
+		snap := a.runtime.Current()
+		if snap != nil {
+			return config.ServerFromGlobalConfig(&snap.Config)
+		}
+	}
+	return a.fallback
 }
 
 func (a *sessionConfigAdapter) SessionTTL() time.Duration {
-	raw := a.serverCfg.SessionTTL
+	raw := a.currentServerConfig().SessionTTL
 	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
 		return d
 	}
@@ -370,9 +428,13 @@ func (a *sessionConfigAdapter) SessionTTL() time.Duration {
 }
 
 func (a *sessionConfigAdapter) MaxSessions() int {
-	return a.serverCfg.MaxSessions
+	return a.currentServerConfig().MaxSessions
 }
 
 func NewSessionConfigAdapter(cfg config.ServerConfig) session.ConfigAccessor {
-	return &sessionConfigAdapter{serverCfg: cfg}
+	return &sessionConfigAdapter{fallback: cfg}
+}
+
+func NewSessionConfigAdapterFromRuntime(rt *runtime.Runtime, fallback config.ServerConfig) session.ConfigAccessor {
+	return &sessionConfigAdapter{runtime: rt, fallback: fallback}
 }

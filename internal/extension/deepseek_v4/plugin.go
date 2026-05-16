@@ -6,10 +6,10 @@ import (
 	"log/slog"
 	"strings"
 
-	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/config"
-	"moonbridge/internal/protocol/anthropic"
+	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/format"
+	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/protocol/openai"
 )
 
@@ -35,10 +35,11 @@ type EnabledFunc func(modelAlias string) bool
 // DSPlugin implements the new plugin.Plugin interface plus relevant capabilities.
 type DSPlugin struct {
 	plugin.BasePlugin
-	isEnabled EnabledFunc
-	pluginCfg config.PluginConfig
-	logger    *slog.Logger
-	cfg       *Config
+	isEnabled     EnabledFunc
+	pluginCfg     config.PluginConfig
+	currentConfig func() config.Config
+	logger        *slog.Logger
+	cfg           *Config
 }
 
 // NewPlugin creates a DeepSeek V4 plugin.
@@ -53,6 +54,9 @@ func NewPlugin(isEnabled ...EnabledFunc) *DSPlugin {
 func (p *DSPlugin) Name() string                              { return PluginName }
 func (p *DSPlugin) ConfigSpecs() []config.ExtensionConfigSpec { return ConfigSpecs() }
 func (p *DSPlugin) EnabledForModel(model string) bool {
+	if p.currentConfig != nil {
+		return p.currentConfig().ExtensionEnabled(PluginName, model)
+	}
 	if p.isEnabled != nil {
 		return p.isEnabled(model)
 	}
@@ -63,6 +67,7 @@ func (p *DSPlugin) EnabledForModel(model string) bool {
 }
 func (p *DSPlugin) Init(ctx plugin.PluginContext) error {
 	p.pluginCfg = config.PluginFromGlobalConfig(&ctx.AppConfig)
+	p.currentConfig = ctx.CurrentConfig
 	p.logger = ctx.Logger
 	p.cfg = plugin.Config[Config](ctx)
 	return nil
@@ -112,12 +117,13 @@ func (p *DSPlugin) MutateRequest(ctx *plugin.RequestContext, req *format.CoreReq
 // --- MessageRewriter ---
 
 func (p *DSPlugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.CoreMessage) []format.CoreMessage {
-	if p.cfg == nil || p.cfg.ReinforceInstructions == nil || !*p.cfg.ReinforceInstructions {
+	cfg := p.configForModel(modelAliasFromRequestContext(ctx))
+	if cfg == nil || cfg.ReinforceInstructions == nil || !*cfg.ReinforceInstructions {
 		return messages
 	}
 	prompt := DefaultReinforcePrompt
-	if p.cfg.ReinforcePrompt != nil && *p.cfg.ReinforcePrompt != "" {
-		prompt = *p.cfg.ReinforcePrompt
+	if cfg.ReinforcePrompt != nil && *cfg.ReinforcePrompt != "" {
+		prompt = *cfg.ReinforcePrompt
 	}
 	// Inject a reinforcement message before the last real user message.
 	// Skip tool_result messages (they have Role="user" but are tool responses).
@@ -136,6 +142,34 @@ func (p *DSPlugin) RewriteMessages(ctx *plugin.RequestContext, messages []format
 		}
 	}
 	return messages
+}
+
+func (p *DSPlugin) configForModel(modelAlias string) *Config {
+	if p.currentConfig != nil {
+		current := p.currentConfig()
+		cfg, _ := current.ExtensionConfig(PluginName, modelAlias).(*Config)
+		if cfg != nil {
+			return cfg
+		}
+		raw := current.ExtensionRawConfig(PluginName, modelAlias)
+		if len(raw) > 0 {
+			data, err := json.Marshal(raw)
+			if err == nil {
+				var decoded Config
+				if err := json.Unmarshal(data, &decoded); err == nil {
+					return &decoded
+				}
+			}
+		}
+	}
+	return p.cfg
+}
+
+func modelAliasFromRequestContext(ctx *plugin.RequestContext) string {
+	if ctx == nil {
+		return ""
+	}
+	return ctx.ModelAlias
 }
 
 // isToolResultMessageFormat checks if a user message contains only tool_result blocks.
@@ -331,8 +365,8 @@ func (p *DSPlugin) OnStreamEvent(ctx *plugin.StreamContext, event plugin.StreamE
 		}
 		// Track tool_use block IDs so they can be matched to thinking blocks
 		// during RememberStreamResult.
-			if event.Block != nil && event.Block.Type == "tool_use" && event.Block.ToolUseID != "" {
-				ss.RecordToolCall(event.Block.ToolUseID)
+		if event.Block != nil && event.Block.Type == "tool_use" && event.Block.ToolUseID != "" {
+			ss.RecordToolCall(event.Block.ToolUseID)
 		}
 	case "block_delta":
 		if ss.Delta(event.Index, event.Delta) {

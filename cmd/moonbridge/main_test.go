@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"moonbridge/internal/extension/codex"
 	"moonbridge/internal/config"
+	"moonbridge/internal/extension/codex"
 )
 
 func TestPrintCodexConfigTomlDoesNotSetServiceTier(t *testing.T) {
@@ -23,7 +23,7 @@ func TestPrintCodexConfigTomlDoesNotSetServiceTier(t *testing.T) {
 		},
 	}
 	err := codex.GenerateConfigToml(&output, "moonbridge", "http://127.0.0.1:38440/v1", "",
-		config.ProviderFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
+		config.ProviderFromGlobalConfig(&cfg), config.PluginFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
 	if err != nil {
 		t.Fatalf("codex.GenerateConfigToml() error = %v", err)
 	}
@@ -83,7 +83,7 @@ routes:
 	for _, want := range []string{
 		"Moon Bridge 启动失败：配置文件加载失败",
 		"配置文件: " + configPath,
-"providers.openai.protocol must be \"anthropic\", \"openai-response\", \"google-genai\", or \"openai-chat\"",
+		"providers.openai.protocol must be \"anthropic\", \"openai-response\", \"google-genai\", or \"openai-chat\"",
 		"Responses 直通请使用 openai-response",
 	} {
 		if !strings.Contains(output, want) {

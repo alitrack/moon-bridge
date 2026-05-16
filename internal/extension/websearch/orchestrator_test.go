@@ -1,8 +1,12 @@
 package websearch
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
 	"moonbridge/internal/protocol/anthropic"
@@ -383,4 +387,89 @@ func TestCollectContentFromEvents_preservesNonRebuiltBlockFields(t *testing.T) {
 
 	// Drain staticStream fully as a final sanity check.
 	fmt.Println("staticStream drain test: OK")
+}
+
+type orchestratorRTFunc func(*http.Request) (*http.Response, error)
+
+func (fn orchestratorRTFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func newTestAnthropicClient(t *testing.T, rt http.RoundTripper) *anthropic.Client {
+	t.Helper()
+	return anthropic.NewClient(anthropic.ClientConfig{
+		BaseURL: "https://provider.example.test",
+		APIKey:  "test-key",
+		Version: "2023-06-01",
+		Client:  &http.Client{Transport: rt},
+	})
+}
+
+func TestOrchestratorCreateMessage_PreservesAssistantBlockOrder(t *testing.T) {
+	var payloads []anthropic.MessageRequest
+	client := newTestAnthropicClient(t, orchestratorRTFunc(func(r *http.Request) (*http.Response, error) {
+		var req anthropic.MessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		payloads = append(payloads, req)
+
+		if len(payloads) == 1 {
+			body := `{"id":"msg_1","type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"text","text":"Before search."},{"type":"tool_use","id":"tu_1","name":"tavily_search","input":{"query":""}},{"type":"text","text":"After search."}]}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+			}, nil
+		}
+		// Validate follow-up assistant content keeps original ordering.
+		if len(req.Messages) < 2 {
+			t.Fatalf("expected follow-up messages, got %d", len(req.Messages))
+		}
+		assistant := req.Messages[len(req.Messages)-2]
+		if assistant.Role != "assistant" {
+			t.Fatalf("expected assistant message before tool_result, got role=%q", assistant.Role)
+		}
+		if len(assistant.Content) != 3 {
+			t.Fatalf("assistant content len=%d, want 3", len(assistant.Content))
+		}
+		if assistant.Content[0].Type != "text" || assistant.Content[0].Text != "Before search." {
+			t.Fatalf("content[0]=%+v", assistant.Content[0])
+		}
+		if assistant.Content[1].Type != "tool_use" || assistant.Content[1].ID != "tu_1" {
+			t.Fatalf("content[1]=%+v", assistant.Content[1])
+		}
+		if assistant.Content[2].Type != "text" || assistant.Content[2].Text != "After search." {
+			t.Fatalf("content[2]=%+v", assistant.Content[2])
+		}
+
+		body := `{"id":"msg_2","type":"message","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"final"}]}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	}))
+
+	orch := NewInjectedOrchestrator(OrchestratorConfig{
+		Anthropic:       client,
+		TavilyKey:       "",
+		FirecrawlKey:    "",
+		SearchMaxRounds: 3,
+	})
+
+	resp, err := orch.CreateMessage(context.Background(), anthropic.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 32,
+		Messages:  []anthropic.Message{{Role: "user", Content: []anthropic.ContentBlock{{Type: "text", Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatalf("CreateMessage error: %v", err)
+	}
+	if resp.ID != "msg_2" {
+		t.Fatalf("final response id=%q, want msg_2", resp.ID)
+	}
+	if len(payloads) != 2 {
+		t.Fatalf("request count=%d, want 2", len(payloads))
+	}
 }

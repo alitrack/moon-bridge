@@ -13,8 +13,8 @@ import (
 	"testing"
 
 	"moonbridge/internal/extension/plugin"
-	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/format"
+	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/protocol/openai"
 )
 
@@ -38,8 +38,8 @@ type e2eMockPlugin struct {
 	filterBlockType string
 
 	// RememberCoreContent tracking
-	rememberCalled      bool
-	rememberedContent   []format.CoreContentBlock
+	rememberCalled    bool
+	rememberedContent []format.CoreContentBlock
 }
 
 func (p *e2eMockPlugin) Name() string { return "e2e-test-plugin" }
@@ -78,11 +78,12 @@ type e2eMockPlugin2 struct {
 
 	mutatorCalled        bool
 	mutatorModifiedModel string
+	enabled              bool
 }
 
 func (p *e2eMockPlugin2) Name() string { return "e2e-test-plugin-2" }
 
-func (p *e2eMockPlugin2) EnabledForModel(string) bool { return true }
+func (p *e2eMockPlugin2) EnabledForModel(string) bool { return p.enabled }
 
 func (p *e2eMockPlugin2) MutateCoreRequest(ctx context.Context, req *format.CoreRequest) {
 	p.mu.Lock()
@@ -963,7 +964,7 @@ func TestPluginHooks_AdditionalHookAutoMapping(t *testing.T) {
 	}
 
 	// Call FilterContent directly and verify it works.
-	ctx := context.Background()
+	ctx := format.WithCoreHookModelAlias(context.Background(), "test-model")
 	block := &format.CoreContentBlock{Type: "text", Text: "test block"}
 	skip := hooks.FilterContent(ctx, block)
 	if skip {
@@ -1006,4 +1007,98 @@ func TestPluginHooks_AdditionalHookAutoMapping(t *testing.T) {
 	if hooks.PrependThinkingToAssistant == nil {
 		t.Error("PrependThinkingToAssistant is nil after WithDefaults()")
 	}
+}
+
+func TestPluginHooks_CoreHooksRespectEnabledForModel(t *testing.T) {
+	if os.Getenv("TEST_ANTHROPIC_API_KEY") != "" {
+		t.Skip("Real mode: skip mock test when TEST_ANTHROPIC_API_KEY is set")
+	}
+
+	ctx := context.Background()
+	cfg := e2eMinimalConfig()
+
+	enabledPlugin := &e2eMockPlugin{}
+	disabledPlugin := &e2eMockPlugin2{enabled: false}
+
+	pReg := plugin.NewRegistry(nil)
+	pReg.Register(enabledPlugin)
+	pReg.Register(disabledPlugin)
+	hooks := pReg.CorePluginHooks()
+
+	reg := newTestRegistry(t, cfg, hooks)
+	client, ok := reg.GetClient(configOpenAIResponse)
+	if !ok {
+		t.Fatal("client adapter not found")
+	}
+	provider, ok := reg.GetProvider(configAnthropic)
+	if !ok {
+		t.Fatal("provider adapter not found")
+	}
+
+	mockSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{
+			"id": "msg_gate_001",
+			"type": "message",
+			"role": "assistant",
+			"content": [{"type": "text", "text": "EnabledForModel gate test"}],
+			"model": "claude-3.5-sonnet-20241022",
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 10, "output_tokens": 5}
+		}`)
+	}))
+	defer mockSrv.Close()
+
+	openAIReq := openai.ResponsesRequest{
+		Model:           "claude-3.5-sonnet",
+		Input:           json.RawMessage(`"Gate me"`),
+		MaxOutputTokens: 100,
+	}
+
+	coreReq, err := client.ToCoreRequest(ctx, &openAIReq)
+	if err != nil {
+		t.Fatalf("ToCoreRequest: %v", err)
+	}
+
+	upstreamAny, err := provider.FromCoreRequest(ctx, coreReq)
+	if err != nil {
+		t.Fatalf("FromCoreRequest: %v", err)
+	}
+	upstreamReq := upstreamAny.(*anthropic.MessageRequest)
+
+	anthClient := anthropic.NewClient(anthropic.ClientConfig{
+		BaseURL: mockSrv.URL,
+		APIKey:  "test-key",
+		Client:  mockSrv.Client(),
+	})
+	upstreamResp, err := anthClient.CreateMessage(ctx, *upstreamReq)
+	if err != nil {
+		t.Fatalf("CreateMessage: %v", err)
+	}
+
+	coreResp, err := provider.ToCoreResponse(ctx, &upstreamResp)
+	if err != nil {
+		t.Fatalf("ToCoreResponse: %v", err)
+	}
+
+	_, err = client.FromCoreResponse(ctx, coreResp)
+	if err != nil {
+		t.Fatalf("FromCoreResponse: %v", err)
+	}
+
+	enabledPlugin.mu.Lock()
+	if !enabledPlugin.mutatorCalled {
+		t.Error("enabled plugin MutateCoreRequest was not called")
+	}
+	if !enabledPlugin.rememberCalled {
+		t.Error("enabled plugin RememberCoreContent was not called")
+	}
+	enabledPlugin.mu.Unlock()
+
+	disabledPlugin.mu.Lock()
+	if disabledPlugin.mutatorCalled {
+		t.Error("disabled plugin MutateCoreRequest should not be called")
+	}
+	disabledPlugin.mu.Unlock()
 }

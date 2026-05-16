@@ -12,6 +12,12 @@ import (
 	mbtrace "moonbridge/internal/service/trace"
 )
 
+type probeWebSearchCandidateFunc func(context.Context, string, string) (bool, error)
+
+func (fn probeWebSearchCandidateFunc) ProbeWebSearchCandidate(ctx context.Context, providerKey, upstreamModel string) (bool, error) {
+	return fn(ctx, providerKey, upstreamModel)
+}
+
 func TestWelcomeMessage(t *testing.T) {
 	want := "欢迎使用 Moon Bridge!"
 
@@ -173,6 +179,81 @@ func TestResolvePerProviderWebSearchAppliesProviderCatalogModelOverride(t *testi
 	}
 	if got := pm.ResolvedWebSearchForModel("main/claude-test"); got != "enabled" {
 		t.Fatalf("ResolvedWebSearchForModel(main/claude-test) = %q, want enabled", got)
+	}
+}
+
+func TestResolveModelWebSearchCandidateFallsBackToInjectedWhenUnsupported(t *testing.T) {
+	cfg := config.Config{
+		TavilyAPIKey: "tavily-key",
+	}
+	pm, err := provider.NewProviderManager(
+		map[string]provider.ProviderConfig{
+			"opencode": {
+				BaseURL: "https://opencode.example.test",
+				APIKey:  "key-opencode",
+			},
+		},
+		map[string]provider.ModelRoute{
+			"deepseek-v4-pro": {Provider: "opencode", Name: "deepseek-v4-pro"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var errors bytes.Buffer
+	resolved := resolveModelWebSearchWithProber(
+		context.Background(),
+		"deepseek-v4-pro",
+		"opencode",
+		"deepseek-v4-pro",
+		config.WebSearchSupportAuto,
+		pm,
+		cfg,
+		&errors,
+		probeWebSearchCandidateFunc(func(context.Context, string, string) (bool, error) {
+			return false, nil
+		}),
+	)
+
+	if resolved != "injected" {
+		t.Fatalf("resolveModelWebSearchWithProber() = %q, want injected", resolved)
+	}
+}
+
+func TestResolveModelWebSearchCandidateKeepsEnabledWhenSupported(t *testing.T) {
+	cfg := config.Config{}
+	pm, err := provider.NewProviderManager(
+		map[string]provider.ProviderConfig{
+			"deepseek": {
+				BaseURL: "https://deepseek.example.test",
+				APIKey:  "key-deepseek",
+			},
+		},
+		map[string]provider.ModelRoute{
+			"deepseek-v4-flash": {Provider: "deepseek", Name: "deepseek-v4-flash"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resolved := resolveModelWebSearchWithProber(
+		context.Background(),
+		"deepseek-v4-flash",
+		"deepseek",
+		"deepseek-v4-flash",
+		config.WebSearchSupportAuto,
+		pm,
+		cfg,
+		&bytes.Buffer{},
+		probeWebSearchCandidateFunc(func(context.Context, string, string) (bool, error) {
+			return true, nil
+		}),
+	)
+
+	if resolved != "enabled" {
+		t.Fatalf("resolveModelWebSearchWithProber() = %q, want enabled", resolved)
 	}
 }
 

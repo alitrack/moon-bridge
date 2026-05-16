@@ -61,7 +61,7 @@ func (o *Orchestrator) CreateMessage(ctx context.Context, req anthropic.MessageR
 	}
 	req, availableImages := prepareRequestForVisual(req)
 	log := slog.Default()
-	for round := 0; round <= o.maxRounds; round++ {
+	for round := 0; round < o.maxRounds; round++ {
 		resp, err := o.upstream.CreateMessage(ctx, req)
 		if err != nil {
 			return anthropic.MessageResponse{}, err
@@ -106,7 +106,7 @@ func (o *Orchestrator) StreamMessage(ctx context.Context, req anthropic.MessageR
 	req, availableImages := prepareRequestForVisual(req)
 	log := slog.Default()
 	var allEvents []anthropic.StreamEvent
-	for round := 0; round <= o.maxRounds; round++ {
+	for round := 0; round < o.maxRounds; round++ {
 		stream, err := o.upstream.StreamMessage(ctx, req)
 		if err != nil {
 			return nil, err

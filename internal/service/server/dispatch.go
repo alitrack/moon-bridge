@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/config"
+	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/protocol/openai"
 	"moonbridge/internal/service/provider"
@@ -98,7 +98,9 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 	if resolveErr == nil {
 		var candidateInfo string
 		for i, c := range resolvedRoute.Candidates {
-			if i > 0 { candidateInfo += ", " }
+			if i > 0 {
+				candidateInfo += ", "
+			}
 			candidateInfo += c.ProviderKey + "=" + c.UpstreamModel + "(p" + fmt.Sprint(i) + ")"
 		}
 		log.Debug("路由解析结果", "model", responsesRequest.Model, "candidates", candidateInfo)
@@ -194,12 +196,12 @@ func (server *Server) writeTrace(record mbtrace.Record) {
 	// Chat 分类：openai-chat 协议的请求/响应
 	if shouldWriteChatTrace(record) {
 		server.writeTraceCategory("Chat", requestNumber, mbtrace.Record{
-			HTTPRequest:        record.HTTPRequest,
-			Model:              record.Model,
-			ChatRequest:        record.ChatRequest,
-			ChatResponse:       record.ChatResponse,
-			ChatStreamEvents:   record.ChatStreamEvents,
-			Error:              record.Error,
+			HTTPRequest:      record.HTTPRequest,
+			Model:            record.Model,
+			ChatRequest:      record.ChatRequest,
+			ChatResponse:     record.ChatResponse,
+			ChatStreamEvents: record.ChatStreamEvents,
+			Error:            record.Error,
 		})
 	}
 
@@ -276,6 +278,7 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 	var hookErr string
 	var lastErr error
 	actualModel := "" // updated with the successfully used upstream model
+	pm := server.activeProviderManager()
 	defer func() {
 		if hookErr != "" {
 			server.onRequestCompleted(
@@ -285,7 +288,7 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 		}
 	}()
 	log := slog.Default().With("path", request.URL.Path, "method", request.Method)
-	if server.providerMgr == nil {
+	if pm == nil {
 		log.Error("未配置 OpenAI Responses 直通的提供商管理器")
 		payload := openai.ErrorResponse{Error: openai.ErrorObject{
 			Message: "提供商路由未配置",
@@ -326,9 +329,14 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 		providerKey := candidate.ProviderKey
 		isLast := i == len(openaiCandidates)-1
 		log := logger.L().With("provider", providerKey, "attempt", i+1)
+		if candidate.Client == nil {
+			if dynamicClient, err := pm.ClientForKey(providerKey); err == nil {
+				candidate.Client = dynamicClient
+			}
+		}
 
-		baseURL := server.providerMgr.ProviderBaseURL(providerKey)
-		apiKey := server.providerMgr.ProviderAPIKey(providerKey)
+		baseURL := pm.ProviderBaseURL(providerKey)
+		apiKey := pm.ProviderAPIKey(providerKey)
 		if baseURL == "" {
 			if isLast {
 				log.Error("OpenAI 提供商缺少 base_url")
@@ -363,7 +371,7 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 		actualModel = candidate.UpstreamModel
 
 		// Inject web_search tool if enabled for this model.
-		if server.providerMgr.ResolvedWebSearchForModel(responsesRequest.Model) == "enabled" {
+		if pm.ResolvedWebSearchForModel(responsesRequest.Model) == "enabled" {
 			upstreamRequest.Tools = InjectWebSearchTool(upstreamRequest.Tools)
 		}
 
@@ -520,7 +528,7 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 		}
 		cost := float64(0)
 		if server.stats != nil {
-			cost = computeCostWithProviderPricing(server.providerMgr, server.stats, responsesRequest.Model, actualModel, providerKey, billingUsage)
+			cost = computeCostWithProviderPricing(pm, server.stats, responsesRequest.Model, actualModel, providerKey, billingUsage)
 		}
 		server.onRequestCompleted(
 			responsesRequest.Model, actualModel, providerKey, proxyStart,

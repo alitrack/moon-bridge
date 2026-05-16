@@ -81,7 +81,7 @@ func (a *OpenAIAdapter) ToCoreRequest(ctx context.Context, req any) (*format.Cor
 	openaiReq.Input = preprocessed
 
 	// 2. Parse Input → Messages + System.
-	messages, system, err := convertInput(openaiReq.Input)
+	messages, system, err := convertInput(openaiReq.Input, openaiReq.Model)
 	if err != nil {
 		return nil, fmt.Errorf("invalid input: %w", err)
 	}
@@ -369,6 +369,7 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 	outputIndexes := make(map[int]int)
 	itemIDs := make(map[int]string)
 	reasonIndexes := make(map[int]bool)
+	toolCallFinalized := make(map[int]bool)
 
 	for event := range events {
 		// Let hooks skip events.
@@ -627,20 +628,28 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 				},
 			})
 
-		// ==================================================================
-		// Tool call arguments done
-		// ==================================================================
+			// ==================================================================
+			// Tool call arguments done
+			// ==================================================================
 		case format.CoreToolCallArgsDone:
 			index := event.Index
+			if toolCallFinalized[index] {
+				break
+			}
+			finalArgs := event.Delta
+			if finalArgs == "" {
+				finalArgs = toolCallArgs[index]
+			}
 			if idx, ok := outputIndexes[index]; ok && idx < len(response.Output) {
-				response.Output[idx].Arguments = event.Delta
+				response.Output[idx].Arguments = finalArgs
 				response.Output[idx].Status = "completed"
 				if response.Output[idx].Type == "custom_tool_call" {
-					if bn, ok := toolBlockNames[index]; ok && event.Delta != "" {
-						response.Output[idx].Input = codextool.RebuildGrammar(bn, json.RawMessage(event.Delta))
+					if bn, ok := toolBlockNames[index]; ok && finalArgs != "" {
+						response.Output[idx].Input = codextool.RebuildGrammar(bn, json.RawMessage(finalArgs))
 					}
 				}
 			}
+			toolCallFinalized[index] = true
 			send(StreamEvent{
 				Event: "response.function_call_arguments.done",
 				Data: FunctionCallArgumentsDoneEvent{
@@ -648,7 +657,7 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 					SequenceNumber: next(),
 					ItemID:         itemIDs[index],
 					OutputIndex:    outputIndexes[index],
-					Arguments:      event.Delta,
+					Arguments:      finalArgs,
 				},
 			})
 			send(StreamEvent{
@@ -839,6 +848,9 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 				delete(contentText, index)
 
 			} else if _, ok := outputIndexes[index]; ok {
+				if toolCallFinalized[index] {
+					break
+				}
 				// 2. Tool_use block done — emit function_call_arguments.done + output_item.done.
 				itemID := itemIDs[index]
 				outputIndex := outputIndexes[index]
@@ -880,6 +892,7 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 						Item:           response.Output[outputIndexes[index]],
 					},
 				})
+				toolCallFinalized[index] = true
 
 				// Clean up state.
 				delete(toolCallArgs, index)
@@ -934,9 +947,9 @@ type inputItem struct {
 //   - Items with role "system" or "developer" → system blocks.
 //   - Items with role "assistant" → assistant messages (including tool_use blocks
 //     from function_call items).
-//   - Items with type "function_call_output" → tool_result user messages.
-//   - Items with type "function_call" → tool_use within assistant messages.
-func convertInput(raw json.RawMessage) ([]format.CoreMessage, []format.CoreContentBlock, error) {
+//   - Items with tool-call output types → tool_result user messages.
+//   - Items with tool-call input types → tool_use within assistant messages.
+func convertInput(raw json.RawMessage, model string) ([]format.CoreMessage, []format.CoreContentBlock, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil, nil
 	}
@@ -976,7 +989,14 @@ func convertInput(raw json.RawMessage) ([]format.CoreMessage, []format.CoreConte
 	var pendingFCBlocks []format.CoreContentBlock // batch consecutive function_calls
 
 	for _, item := range items {
-		if item.Type == "function_call_output" {
+		if isToolCallOutputType(item.Type) {
+			// Keep any pending reasoning within the same assistant tool-call turn.
+			// Emitting a standalone assistant reasoning message here would break
+			// the required adjacency of assistant tool_use -> immediate tool_result.
+			if len(pendingFCBlocks) > 0 && len(pendingReasoning) > 0 {
+				pendingFCBlocks = mergeReasoningBeforeToolUse(pendingFCBlocks, pendingReasoning)
+				pendingReasoning = pendingReasoning[:0]
+			}
 			// Flush pending function_calls before tool results.
 			if len(pendingFCBlocks) > 0 {
 				flushed := make([]format.CoreContentBlock, len(pendingFCBlocks))
@@ -1011,7 +1031,7 @@ func convertInput(raw json.RawMessage) ([]format.CoreMessage, []format.CoreConte
 		// Flush pending function_calls before non-function-call items.
 		// Don't flush between consecutive function_call items — they should
 		// be batched into a single assistant message.
-		if item.Type != "function_call" && item.Type != "custom_tool_call" && item.Type != "local_shell_call" && len(pendingFCBlocks) > 0 {
+		if !isToolCallInputType(item.Type) && item.Type != "reasoning" && len(pendingFCBlocks) > 0 {
 			flushed := make([]format.CoreContentBlock, len(pendingFCBlocks))
 			copy(flushed, pendingFCBlocks)
 			messages = append(messages, format.CoreMessage{
@@ -1029,6 +1049,10 @@ func convertInput(raw json.RawMessage) ([]format.CoreMessage, []format.CoreConte
 		// Handle reasoning input items — convert to thinking blocks for the next assistant message.
 		if item.Type == "reasoning" {
 			blocks := reasoningBlocksFromSummary(item.Summary)
+			if len(pendingFCBlocks) > 0 {
+				pendingFCBlocks = mergeReasoningBeforeToolUse(pendingFCBlocks, blocks)
+				continue
+			}
 			pendingReasoning = append(pendingReasoning, blocks...)
 			continue
 		}
@@ -1042,6 +1066,12 @@ func convertInput(raw json.RawMessage) ([]format.CoreMessage, []format.CoreConte
 			// dummy reasoning block is injected if pendingReasoning is empty.
 			// A future fix should add a dummy reasoning block here when:
 			// (a) the model is a reasoning model, and (b) pendingReasoning is empty.
+			if len(pendingReasoning) == 0 && isReasoningModel(model) {
+				pendingReasoning = append(pendingReasoning, format.CoreContentBlock{
+					Type:          "reasoning",
+					ReasoningText: "",
+				})
+			}
 
 			// function_call in input → tool_use assistant block.
 			// Collect into pendingFCBlocks to batch consecutive calls into a single assistant message.
@@ -1331,12 +1361,56 @@ func reasoningBlocksFromSummary(raw json.RawMessage) []format.CoreContentBlock {
 	return blocks
 }
 
+func mergeReasoningBeforeToolUse(blocks []format.CoreContentBlock, reasoning []format.CoreContentBlock) []format.CoreContentBlock {
+	if len(reasoning) == 0 {
+		return blocks
+	}
+	insertAt := 0
+	for insertAt < len(blocks) && blocks[insertAt].Type == "reasoning" {
+		insertAt++
+	}
+	merged := make([]format.CoreContentBlock, 0, len(blocks)+len(reasoning))
+	merged = append(merged, blocks[:insertAt]...)
+	merged = append(merged, reasoning...)
+	merged = append(merged, blocks[insertAt:]...)
+	return merged
+}
+
+func isToolCallInputType(itemType string) bool {
+	switch itemType {
+	case "function_call", "custom_tool_call", "local_shell_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func isToolCallOutputType(itemType string) bool {
+	switch itemType {
+	case "function_call_output", "custom_tool_call_output", "local_shell_call_output":
+		return true
+	default:
+		return false
+	}
+}
+
 // cloneResponse creates a shallow copy of a Response for use in stream events.
 func cloneResponse(r *Response) Response {
 	if r == nil {
 		return Response{}
 	}
 	return *r
+}
+
+func isReasoningModel(model string) bool {
+	m := strings.TrimSpace(strings.ToLower(model))
+	if m == "" {
+		return false
+	}
+	return strings.HasPrefix(m, "o1") ||
+		strings.HasPrefix(m, "o3") ||
+		strings.HasPrefix(m, "o4") ||
+		strings.Contains(m, "reasoning")
 }
 
 // toolInputString converts a json.RawMessage tool input to a string,
@@ -1458,7 +1532,7 @@ func convertToolWithNamespace(tool Tool, namespace string) []format.CoreTool {
 			Description: tool.Description,
 			InputSchema: tool.Parameters,
 		}
-		codextool.AnnotateCoreTool(&ct, codextool.ToolFunction, name, namespace)
+		codextool.AnnotateCoreTool(&ct, codextool.ToolFunction, tool.Name, namespace)
 		return []format.CoreTool{ct}
 
 	case "web_search", "web_search_preview":
@@ -1507,13 +1581,13 @@ func convertToolWithNamespace(tool Tool, namespace string) []format.CoreTool {
 				Description: tool.Description,
 				InputSchema: codextool.LocalShellSchema(),
 			}
-			codextool.AnnotateCoreTool(&ct, codextool.ToolLocalShell, name, "")
+			codextool.AnnotateCoreTool(&ct, codextool.ToolLocalShell, tool.Name, "")
 			return []format.CoreTool{ct}
 		}
 		if codextool.IsApplyPatchGrammar(grammar) {
 			proxyTools := codextool.ApplyPatchProxyCoreTools(name)
 			for i := range proxyTools {
-				codextool.AnnotateCoreTool(&proxyTools[i], codextool.ToolApplyPatch, name, "")
+				codextool.AnnotateCoreTool(&proxyTools[i], codextool.ToolApplyPatch, tool.Name, "")
 			}
 			return proxyTools
 		}
@@ -1523,7 +1597,7 @@ func convertToolWithNamespace(tool Tool, namespace string) []format.CoreTool {
 				Description: codextool.ExecProxyDescription(),
 				InputSchema: codextool.ExecProxySchema(),
 			}
-			codextool.AnnotateCoreTool(&ct, codextool.ToolExec, name, "")
+			codextool.AnnotateCoreTool(&ct, codextool.ToolExec, tool.Name, "")
 			return []format.CoreTool{ct}
 		}
 		// Other custom tools: keep original name with raw input schema
@@ -1532,7 +1606,7 @@ func convertToolWithNamespace(tool Tool, namespace string) []format.CoreTool {
 			Description: customToolDescription(tool, grammar),
 			InputSchema: codextool.CustomToolInputSchema(grammar),
 		}
-		codextool.AnnotateCoreTool(&ct, codextool.ToolRaw, name, "")
+		codextool.AnnotateCoreTool(&ct, codextool.ToolRaw, tool.Name, "")
 		return []format.CoreTool{ct}
 
 	default:

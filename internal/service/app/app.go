@@ -12,13 +12,12 @@ import (
 	"log/slog"
 	"moonbridge/internal/config"
 	"moonbridge/internal/db"
-	"moonbridge/internal/service/store"
+	"moonbridge/internal/format"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/protocol/anthropic"
-	"moonbridge/internal/protocol/google"
-	"moonbridge/internal/protocol/chat"
 	"moonbridge/internal/protocol/cache"
-	"moonbridge/internal/format"
+	"moonbridge/internal/protocol/chat"
+	"moonbridge/internal/protocol/google"
 	"moonbridge/internal/protocol/openai"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/proxy"
@@ -28,6 +27,7 @@ import (
 	"moonbridge/internal/service/server/trace"
 	"moonbridge/internal/service/server/usage"
 	"moonbridge/internal/service/stats"
+	"moonbridge/internal/service/store"
 	mbtrace "moonbridge/internal/service/trace"
 )
 
@@ -58,6 +58,8 @@ func RunServer(ctx context.Context, cfg config.Config, errors io.Writer) error {
 }
 
 func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) error {
+	var rt *runtime.Runtime
+
 	// Construct domain configs from global config.
 	serverCfg := config.ServerFromGlobalConfig(&cfg)
 	cacheCfg := config.CacheFromGlobalConfig(&cfg)
@@ -65,11 +67,11 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 	storeCfg := config.StoreFromGlobalConfig(&cfg)
 	persistCfg := config.PersistenceFromGlobalConfig(&cfg)
 	providerCfg := config.ProviderFromGlobalConfig(&cfg)
-	_ = persistCfg   // used in db init
-	_ = storeCfg     // used in config store
-	_ = proxyCfg     // used in proxy mode
+	_ = persistCfg // used in db init
+	_ = storeCfg   // used in config store
+	_ = proxyCfg   // used in proxy mode
 
-		// === Phase 1: Bootstrap from YAML ===
+	// === Phase 1: Bootstrap from YAML ===
 
 	// Build multi-provider infrastructure from YAML config.
 	providerDefs := provider.BuildProviderDefsFromConfig(providerCfg)
@@ -103,6 +105,12 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 
 	// Register plugins.
 	plugins := BuiltinExtensions().NewRegistry(slog.Default(), cfg)
+	plugins.SetCurrentConfigProvider(func() config.Config {
+		if rt != nil && rt.Current() != nil {
+			return rt.Current().Config
+		}
+		return cfg
+	})
 	if err := plugins.InitAll(&cfg); err != nil {
 		return fmt.Errorf("init plugins: %w", err)
 	}
@@ -115,9 +123,12 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 
 	// Initialize persistence layer (db.Registry).
 	dbRegistry := db.NewRegistry(slog.Default())
-	for _, p := range plugins.DBProviders() {
+	dbProviders := plugins.DBProviders()
+	providers := make([]db.Provider, 0, len(dbProviders))
+	for _, p := range dbProviders {
 		if prov := p.DBProvider(); prov != nil {
 			dbRegistry.RegisterProvider(prov)
+			providers = append(providers, prov)
 		}
 	}
 	for _, c := range plugins.DBConsumers() {
@@ -129,7 +140,8 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 	configStoreConsumer := store.NewConfigStoreConsumer(logger.L())
 	configStoreConsumer.SetExtensionSpecs(BuiltinExtensions().ConfigSpecs())
 	dbRegistry.RegisterConsumer(configStoreConsumer)
-	if err := dbRegistry.Init(ctx, cfg.Persistence.ActiveProvider); err != nil {
+	activePersistenceProvider := ResolvePersistenceActiveProvider(cfg.Persistence.ActiveProvider, providers)
+	if err := dbRegistry.Init(ctx, activePersistenceProvider); err != nil {
 		return fmt.Errorf("init persistence: %w", err)
 	}
 	defer dbRegistry.Shutdown()
@@ -161,6 +173,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 				if len(pricing) > 0 {
 					sessionStats.SetPricing(pricing)
 				}
+				serverCfg = config.ServerFromGlobalConfig(&cfg)
 			} else {
 				// DB is empty: seed from YAML config.
 				logger.Info("持久化存储为空，从 YAML 导入种子配置")
@@ -179,8 +192,8 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 		logger.Warn("config store 不可用，跳过持久化引导")
 	}
 
-		// === Phase 3: Build Runtime ===
-	rt := runtime.NewRuntime(cfg, providerMgr, pricing)
+	// === Phase 3: Build Runtime ===
+	rt = runtime.NewRuntime(cfg, providerMgr, pricing)
 
 	// === Phase 4: Build Server with Runtime ===
 	// Create shared cache registry (used by both Bridge and Adapter paths).
@@ -203,19 +216,19 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 	_ = adapterReg.RegisterProviderStream(anthAdapter)
 
 	// Upstream: Google GenAI provider adapter.
-		googleCfg := &cache.PlanCacheConfig{
-			Mode:                     cacheCfg.Mode,
-			TTL:                      cacheCfg.TTL,
-			PromptCaching:            cacheCfg.PromptCaching,
-			AutomaticPromptCache:     cacheCfg.AutomaticPromptCache,
-			ExplicitCacheBreakpoints: cacheCfg.ExplicitCacheBreakpoints,
-			AllowRetentionDowngrade:  cacheCfg.AllowRetentionDowngrade,
-			MaxBreakpoints:           cacheCfg.MaxBreakpoints,
-			MinCacheTokens:           cacheCfg.MinCacheTokens,
-			ExpectedReuse:            cacheCfg.ExpectedReuse,
-			MinimumValueScore:        cacheCfg.MinimumValueScore,
-			MinBreakpointTokens:      cacheCfg.MinBreakpointTokens,
-		}
+	googleCfg := &cache.PlanCacheConfig{
+		Mode:                     cacheCfg.Mode,
+		TTL:                      cacheCfg.TTL,
+		PromptCaching:            cacheCfg.PromptCaching,
+		AutomaticPromptCache:     cacheCfg.AutomaticPromptCache,
+		ExplicitCacheBreakpoints: cacheCfg.ExplicitCacheBreakpoints,
+		AllowRetentionDowngrade:  cacheCfg.AllowRetentionDowngrade,
+		MaxBreakpoints:           cacheCfg.MaxBreakpoints,
+		MinCacheTokens:           cacheCfg.MinCacheTokens,
+		ExpectedReuse:            cacheCfg.ExpectedReuse,
+		MinimumValueScore:        cacheCfg.MinimumValueScore,
+		MinBreakpointTokens:      cacheCfg.MinBreakpointTokens,
+	}
 	googleAdapter := google.NewGeminiProviderAdapter(cfg.DefaultMaxTokens, nil, coreHooks, googleCfg, cacheReg)
 	_ = adapterReg.RegisterProvider(googleAdapter)
 	_ = adapterReg.RegisterProviderStream(googleAdapter)
@@ -252,14 +265,13 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 		}
 	}
 
-
 	// Create sub-package managers for session, usage, and trace.
-	sessMgr := session.NewInMemoryManager(server.NewSessionConfigAdapter(serverCfg), plugins)
+	sessMgr := session.NewInMemoryManager(server.NewSessionConfigAdapterFromRuntime(rt, serverCfg), plugins)
 	usageTrk := usage.NewStatsTracker(sessionStats)
 	traceWtr := trace.NewFileWriter(tracer, errors)
 
 	handler := server.New(server.Config{
-		ServerCfg:      serverCfg,
+		ServerCfg:       serverCfg,
 		Provider:        fallbackProvider,
 		ProviderMgr:     providerMgr,
 		ChatClients:     chatClients,
@@ -302,6 +314,10 @@ func resolveDefaultClient(pm *provider.ProviderManager, errors io.Writer) *anthr
 // webSearchProber interface and following functions are unchanged.
 type webSearchProber interface {
 	ProbeWebSearch(context.Context, string) (bool, error)
+}
+
+type webSearchCandidateProber interface {
+	ProbeWebSearchCandidate(context.Context, string, string) (bool, error)
 }
 
 // resolvePerProviderWebSearch resolves web_search support for each provider and
@@ -356,29 +372,32 @@ func resolvePerProviderWebSearch(ctx context.Context, cfg config.Config, pm *pro
 	}
 	// 2. Resolve model-level overrides for provider catalog slugs and route aliases.
 	for providerKey, def := range cfg.ProviderDefs {
-		providerWS := cfg.WebSearchForProvider(providerKey)
 		for modelName := range def.Models {
 			alias := providerKey + "/" + modelName
 			newAlias := modelName + "(" + providerKey + ")"
 			modelWS := cfg.WebSearchForModel(alias)
-			resolveModelWebSearch(ctx, alias, modelWS, providerWS, pm, errors)
-			resolveModelWebSearch(ctx, newAlias, modelWS, providerWS, pm, errors)
+			resolveModelWebSearch(ctx, alias, providerKey, modelName, modelWS, pm, cfg, errors)
+			resolveModelWebSearch(ctx, newAlias, providerKey, modelName, modelWS, pm, cfg, errors)
 			pureWS := cfg.WebSearchForModel(modelName)
-			resolveModelWebSearch(ctx, modelName, pureWS, providerWS, pm, errors)
+			resolveModelWebSearch(ctx, modelName, providerKey, modelName, pureWS, pm, cfg, errors)
 		}
 	}
 	for alias, route := range cfg.Routes {
 		modelWS := cfg.WebSearchForModel(alias)
-		providerWS := cfg.WebSearchForProvider(route.Provider)
-		resolveModelWebSearch(ctx, alias, modelWS, providerWS, pm, errors)
+		providerKey := route.Provider
+		if providerKey == "" {
+			providerKey = pm.DefaultKey()
+		}
+		resolveModelWebSearch(ctx, alias, providerKey, route.Model, modelWS, pm, cfg, errors)
 	}
 }
 
-func resolveModelWebSearch(ctx context.Context, alias string, modelWS config.WebSearchSupport, providerWS config.WebSearchSupport, pm *provider.ProviderManager, errors io.Writer) {
-	if modelWS == providerWS {
+func resolveModelWebSearch(ctx context.Context, alias, providerKey, upstreamModel string, modelWS config.WebSearchSupport, pm *provider.ProviderManager, cfg config.Config, errors io.Writer) {
+	if alias == "" || providerKey == "" || upstreamModel == "" {
 		return
 	}
 	modelKey := "model:" + alias
+	candidateKey := provider.WebSearchCandidateKey(providerKey, upstreamModel)
 	protocol := pm.ProtocolForModel(alias)
 	switch protocol {
 	case config.ProtocolAnthropic:
@@ -386,30 +405,37 @@ func resolveModelWebSearch(ctx context.Context, alias string, modelWS config.Web
 		switch modelWS {
 		case config.WebSearchSupportDisabled, config.WebSearchSupportInjected:
 			pm.SetResolvedWebSearch(modelKey, "disabled")
+			pm.SetResolvedWebSearch(candidateKey, "disabled")
 			slog.Info("模型禁用响应端网页搜索", "model", alias, "config", modelWS)
 		default:
 			pm.SetResolvedWebSearch(modelKey, "enabled")
+			pm.SetResolvedWebSearch(candidateKey, "enabled")
 			slog.Info("模型启用响应端网页搜索", "model", alias)
 		}
 		return
 	default:
 		pm.SetResolvedWebSearch(modelKey, "disabled")
+		pm.SetResolvedWebSearch(candidateKey, "disabled")
 		slog.Info("跳过模型级网页搜索：不支持的协议", "model", alias, "protocol", protocol)
 		return
 	}
 	switch modelWS {
 	case config.WebSearchSupportDisabled:
 		pm.SetResolvedWebSearch(modelKey, "disabled")
+		pm.SetResolvedWebSearch(candidateKey, "disabled")
 		slog.Info("模型配置禁用网页搜索", "model", alias)
 	case config.WebSearchSupportEnabled:
 		pm.SetResolvedWebSearch(modelKey, "enabled")
+		pm.SetResolvedWebSearch(candidateKey, "enabled")
 		slog.Info("模型配置强制启用网页搜索", "model", alias)
 	case config.WebSearchSupportInjected:
 		pm.SetResolvedWebSearch(modelKey, "injected")
+		pm.SetResolvedWebSearch(candidateKey, "injected")
 		slog.Info("模型配置启用网页搜索注入模式", "model", alias)
 	default:
-		resolved := probeModelWebSearch(ctx, alias, pm, errors)
+		resolved := resolveModelWebSearchWithProber(ctx, alias, providerKey, upstreamModel, modelWS, pm, cfg, errors, pm)
 		pm.SetResolvedWebSearch(modelKey, resolved)
+		pm.SetResolvedWebSearch(candidateKey, resolved)
 	}
 }
 
@@ -480,6 +506,61 @@ func probeModelWebSearch(ctx context.Context, modelAlias string, pm *provider.Pr
 	}
 	slog.Info("模型支持网页搜索", "model", modelAlias)
 	return "enabled"
+}
+
+func probeModelWebSearchCandidate(ctx context.Context, modelAlias, providerKey, upstreamModel string, pm *provider.ProviderManager, cfg config.Config, errors io.Writer) string {
+	return resolveModelWebSearchWithProber(ctx, modelAlias, providerKey, upstreamModel, config.WebSearchSupportAuto, pm, cfg, errors, pm)
+}
+
+func resolveModelWebSearchWithProber(ctx context.Context, modelAlias, providerKey, upstreamModel string, modelWS config.WebSearchSupport, pm *provider.ProviderManager, cfg config.Config, errors io.Writer, prober webSearchCandidateProber) string {
+	switch modelWS {
+	case config.WebSearchSupportDisabled:
+		return "disabled"
+	case config.WebSearchSupportEnabled:
+		return "enabled"
+	case config.WebSearchSupportInjected:
+		return "injected"
+	}
+	if prober == nil {
+		if injectedSearchConfigured(cfg, modelAlias, providerKey) {
+			return "injected"
+		}
+		return "disabled"
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	supported, err := prober.ProbeWebSearchCandidate(probeCtx, providerKey, upstreamModel)
+	if err != nil {
+		slog.Warn("网页搜索模型探测失败", "model", modelAlias, "provider", providerKey, "upstream_model", upstreamModel, "error", err)
+		fmt.Fprintf(errors, "网页搜索模型探测失败（%s via %s/%s）: %v\n", modelAlias, providerKey, upstreamModel, err)
+		if injectedSearchConfigured(cfg, modelAlias, providerKey) {
+			slog.Info("网页搜索模型探测失败，回退到注入模式", "model", modelAlias, "provider", providerKey, "upstream_model", upstreamModel)
+			return "injected"
+		}
+		return "disabled"
+	}
+	if supported {
+		slog.Info("模型支持网页搜索", "model", modelAlias, "provider", providerKey, "upstream_model", upstreamModel)
+		return "enabled"
+	}
+	if injectedSearchConfigured(cfg, modelAlias, providerKey) {
+		slog.Info("模型不支持原生网页搜索，回退到注入模式", "model", modelAlias, "provider", providerKey, "upstream_model", upstreamModel)
+		return "injected"
+	}
+	slog.Warn("模型不支持网页搜索", "model", modelAlias, "provider", providerKey, "upstream_model", upstreamModel)
+	fmt.Fprintf(errors, "模型 %s（%s/%s）不支持网页搜索\n", modelAlias, providerKey, upstreamModel)
+	return "disabled"
+}
+
+func injectedSearchConfigured(cfg config.Config, modelAlias, providerKey string) bool {
+	if cfg.WebSearchTavilyKeyForModel(modelAlias) != "" || cfg.WebSearchFirecrawlKeyForModel(modelAlias) != "" {
+		return true
+	}
+	if providerKey == "" {
+		return false
+	}
+	return cfg.WebSearchTavilyKeyForProvider(providerKey) != "" || cfg.WebSearchFirecrawlKeyForProvider(providerKey) != ""
 }
 
 func runCaptureResponse(ctx context.Context, cfg config.Config, errors io.Writer) error {

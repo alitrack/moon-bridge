@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"moonbridge/internal/session"
 	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/service/api"
+	"moonbridge/internal/session"
 )
 
 // Manager handles session lifecycle: lookup, creation, TTL enforcement,
@@ -28,6 +28,9 @@ type Manager interface {
 
 	// Stop signals the background pruner goroutine to exit.
 	Stop()
+
+	// NewEphemeral creates a request-scoped session not tracked in the manager.
+	NewEphemeral() *session.Session
 }
 
 // ConfigAccessor provides session-related configuration values.
@@ -84,7 +87,11 @@ func (m *InMemoryManager) GetOrCreate(key string, now time.Time) *session.Sessio
 
 	// Enforce max sessions limit.
 	if maxSessions := m.config.MaxSessions(); maxSessions > 0 && len(m.sessions) >= maxSessions {
-		m.evictLRULocked()
+		for len(m.sessions) >= maxSessions {
+			if !m.evictLRULocked() {
+				break
+			}
+		}
 	}
 
 	sess := session.NewWithID(key)
@@ -124,6 +131,18 @@ func (m *InMemoryManager) Stop() {
 	close(m.pruneStop)
 }
 
+// NewEphemeral creates a request-scoped in-memory session and initializes
+// extension state the same way as tracked sessions.
+func (m *InMemoryManager) NewEphemeral() *session.Session {
+	sess := session.New()
+	if m.pluginRegistry != nil {
+		sess.InitExtensions(m.pluginRegistry.NewSessionData())
+	} else {
+		sess.InitExtensions(nil)
+	}
+	return sess
+}
+
 // startPruning runs a background goroutine that prunes every hour.
 func (m *InMemoryManager) startPruning() {
 	ticker := time.NewTicker(time.Hour)
@@ -150,7 +169,7 @@ func (m *InMemoryManager) pruneLocked(now time.Time) {
 
 // evictLRULocked removes the session with the oldest lastUsed timestamp.
 // Must be called with m.mu held.
-func (m *InMemoryManager) evictLRULocked() {
+func (m *InMemoryManager) evictLRULocked() bool {
 	var oldestKey string
 	var oldestTime time.Time
 	first := true
@@ -163,5 +182,7 @@ func (m *InMemoryManager) evictLRULocked() {
 	}
 	if oldestKey != "" {
 		delete(m.sessions, oldestKey)
+		return true
 	}
+	return false
 }

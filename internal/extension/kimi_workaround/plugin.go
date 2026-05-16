@@ -7,10 +7,11 @@
 package kimi_workaround
 
 import (
+	"encoding/json"
 	"fmt"
 
-	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/config"
+	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/format"
 )
 
@@ -29,17 +30,18 @@ type EnabledFunc func(modelAlias string) bool
 
 // Config holds the kimi_workaround extension configuration.
 type Config struct {
-	MaxToolRounds       *int     `json:"max_tool_rounds,omitempty" yaml:"max_tool_rounds"`
-	ConvergenceMargin   *float64 `json:"convergence_margin,omitempty" yaml:"convergence_margin"`
+	MaxToolRounds     *int     `json:"max_tool_rounds,omitempty" yaml:"max_tool_rounds"`
+	ConvergenceMargin *float64 `json:"convergence_margin,omitempty" yaml:"convergence_margin"`
 }
 
 // Plugin implements the kimi workaround extension.
 type Plugin struct {
 	plugin.BasePlugin
-	isEnabled EnabledFunc
-	pluginCfg config.PluginConfig
-	maxRounds int
-	margin    float64
+	isEnabled     EnabledFunc
+	pluginCfg     config.PluginConfig
+	currentConfig func() config.Config
+	maxRounds     int
+	margin        float64
 }
 
 func NewPlugin(isEnabled ...EnabledFunc) *Plugin {
@@ -69,6 +71,7 @@ func ConfigSpecs() []config.ExtensionConfigSpec {
 
 func (p *Plugin) Init(ctx plugin.PluginContext) error {
 	p.pluginCfg = config.PluginFromGlobalConfig(&ctx.AppConfig)
+	p.currentConfig = ctx.CurrentConfig
 	if cfg := plugin.Config[Config](ctx); cfg != nil {
 		if cfg.MaxToolRounds != nil && *cfg.MaxToolRounds > 0 {
 			p.maxRounds = *cfg.MaxToolRounds
@@ -83,6 +86,9 @@ func (p *Plugin) Init(ctx plugin.PluginContext) error {
 func (p *Plugin) Shutdown() error { return nil }
 
 func (p *Plugin) EnabledForModel(model string) bool {
+	if p.currentConfig != nil {
+		return p.currentConfig().ExtensionEnabled(PluginName, model)
+	}
 	if p.isEnabled != nil {
 		return p.isEnabled(model)
 	}
@@ -101,12 +107,7 @@ func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.C
 	if !p.EnabledForModel(modelAlias) {
 		return messages
 	}
-	if p.maxRounds <= 0 {
-		p.maxRounds = 50
-	}
-	if p.margin <= 0 {
-		p.margin = 0.8
-	}
+	maxRounds, margin := p.limitsForModel(modelAlias)
 
 	// Count tool call rounds since the last real user message.
 	// Each new user prompt resets the counter — we only care about how many
@@ -169,7 +170,7 @@ func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.C
 	// When approaching limit: append prompts to the last tool_result's content.
 	// When AT limit: REPLACE the last tool_result's content with a hard error
 	// so the model sees that tools are "broken" and must produce a final answer.
-	threshold := int(float64(p.maxRounds) * p.margin)
+	threshold := int(float64(maxRounds) * margin)
 	messagesCopy := make([]format.CoreMessage, len(messages))
 	copy(messagesCopy, messages)
 
@@ -179,12 +180,12 @@ func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.C
 		if msg.Role == "tool" || (msg.Role == "user" && isToolResultMessage(*msg)) {
 			for j := len(msg.Content) - 1; j >= 0; j-- {
 				if msg.Content[j].Type == "tool_result" && msg.Content[j].ToolUseID != "" {
-					if roundCount >= p.maxRounds {
+					if roundCount >= maxRounds {
 						// Hard cap reached — replace tool_result content with an error.
 						// The model will see the tool as failed and stop calling it.
 						errJSON := fmt.Sprintf(
 							"{\"error\":\"MAX_TOOL_ROUNDS\",\"message\":\"Tool call limit reached after %d rounds. Must produce final response immediately without any additional tool calls.\"}",
-							p.maxRounds,
+							maxRounds,
 						)
 						msg.Content[j].ToolResultContent = []format.CoreContentBlock{{
 							Type: "text",
@@ -193,7 +194,7 @@ func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.C
 						return messagesCopy
 					}
 					// Approaching limit — append prompts.
-					prompt := fmt.Sprintf(DefaultPrompt, roundCount, p.maxRounds)
+					prompt := fmt.Sprintf(DefaultPrompt, roundCount, maxRounds)
 					msg.Content[j].ToolResultContent = append(
 						msg.Content[j].ToolResultContent,
 						format.CoreContentBlock{Type: "text", Text: prompt},
@@ -212,6 +213,39 @@ func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.C
 
 	// Fallback: if we couldn't find a tool_result to append to, return unchanged.
 	return messages
+}
+
+func (p *Plugin) limitsForModel(modelAlias string) (int, float64) {
+	maxRounds := p.maxRounds
+	margin := p.margin
+	if maxRounds <= 0 {
+		maxRounds = 50
+	}
+	if margin <= 0 {
+		margin = 0.8
+	}
+	if p.currentConfig == nil {
+		return maxRounds, margin
+	}
+	raw := p.currentConfig().ExtensionRawConfig(PluginName, modelAlias)
+	if len(raw) == 0 {
+		return maxRounds, margin
+	}
+	var cfg Config
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return maxRounds, margin
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return maxRounds, margin
+	}
+	if cfg.MaxToolRounds != nil && *cfg.MaxToolRounds > 0 {
+		maxRounds = *cfg.MaxToolRounds
+	}
+	if cfg.ConvergenceMargin != nil && *cfg.ConvergenceMargin > 0 {
+		margin = *cfg.ConvergenceMargin
+	}
+	return maxRounds, margin
 }
 
 // isSystemReminder checks if a user message is one of our injected prompts.
@@ -294,7 +328,7 @@ func hasUnmatchedToolUse(messages []format.CoreMessage, lastIdx int) bool {
 }
 
 var (
-	_ plugin.Plugin          = (*Plugin)(nil)
+	_ plugin.Plugin             = (*Plugin)(nil)
 	_ plugin.ConfigSpecProvider = (*Plugin)(nil)
-	_ plugin.MessageRewriter = (*Plugin)(nil)
+	_ plugin.MessageRewriter    = (*Plugin)(nil)
 )

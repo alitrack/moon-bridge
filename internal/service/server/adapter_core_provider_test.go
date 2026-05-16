@@ -137,9 +137,9 @@ type fakeStrictAnthropicClient struct {
 }
 
 func (c *fakeStrictAnthropicClient) CreateMessage(_ context.Context, req any) (any, error) {
-	msgReq, ok := req.(anthropic.MessageRequest)
-	if !ok {
-		return nil, fmt.Errorf("expected anthropic.MessageRequest, got %T", req)
+	msgReq, err := normalizeAnthropicRequest(req)
+	if err != nil {
+		return nil, err
 	}
 	c.got = msgReq
 	return anthropic.MessageResponse{
@@ -268,8 +268,15 @@ func TestAdapterCoreProviderPrependsDeepSeekThinkingBeforeAnthropicUpstream(t *t
 	sess.InitExtensions(map[string]any{
 		"deepseek_v4": deepseekv4.NewState(),
 	})
-	provider := newAdapterCoreProvider(fakeAnthropicToolUseAdapter{}, client)
-	provider.session = sess
+	provider := newFinalizingAdapterCoreProvider(fakeAnthropicToolUseAdapter{}, client,
+		func(_ context.Context, upstream any) (any, error) {
+			msgReq, err := normalizeAnthropicRequest(upstream)
+			if err != nil {
+				return nil, err
+			}
+			prependCachedThinking(&msgReq, sess)
+			return &msgReq, nil
+		})
 
 	_, err := provider.CreateCore(context.Background(), &format.CoreRequest{Model: "deepseek-v4-pro"})
 	if err != nil {

@@ -1,12 +1,11 @@
 package plugin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
-
-	"context"
 
 	"moonbridge/internal/config"
 	"moonbridge/internal/format"
@@ -36,6 +35,7 @@ type Registry struct {
 	routeRegistrars        []RouteRegistrar
 	configSpecs            []config.ExtensionConfigSpec
 	logger                 *slog.Logger
+	currentConfig          func() config.Config
 }
 
 // NewRegistry creates an empty plugin registry.
@@ -44,6 +44,15 @@ func NewRegistry(logger *slog.Logger) *Registry {
 		logger = slog.Default()
 	}
 	return &Registry{logger: logger}
+}
+
+// SetCurrentConfigProvider installs a callback used by plugins that need the
+// latest resolved configuration at request time.
+func (r *Registry) SetCurrentConfigProvider(provider func() config.Config) {
+	if r == nil {
+		return
+	}
+	r.currentConfig = provider
 }
 
 // Register adds a plugin and detects its capabilities.
@@ -137,9 +146,10 @@ func (r *Registry) InitAll(appCfg InitConfigProvider) error {
 			}
 		}
 		ctx := PluginContext{
-			Config:    typedCfg,
-			AppConfig: appConfig,
-			Logger:    r.logger.With("plugin", p.Name()),
+			Config:        typedCfg,
+			AppConfig:     appConfig,
+			CurrentConfig: r.currentConfig,
+			Logger:        r.logger.With("plugin", p.Name()),
 		}
 		if err := p.Init(ctx); err != nil {
 			return fmt.Errorf("plugin %s init failed: %w", p.Name(), err)
@@ -491,9 +501,13 @@ func (r *Registry) CorePluginHooks() format.CorePluginHooks {
 		// MutateCoreRequest
 		if m, ok := p.(CoreRequestMutator); ok {
 			prev := hooks.MutateCoreRequest
+			pluginImpl := p
 			hooks.MutateCoreRequest = func(ctx context.Context, req *format.CoreRequest) {
 				if prev != nil {
 					prev(ctx, req)
+				}
+				if req == nil || !pluginImpl.EnabledForModel(req.Model) {
+					return
 				}
 				m.MutateCoreRequest(ctx, req)
 			}
@@ -501,9 +515,14 @@ func (r *Registry) CorePluginHooks() format.CorePluginHooks {
 		// FilterCoreContent
 		if f, ok := p.(CoreContentFilter); ok {
 			prev := hooks.FilterContent
+			pluginImpl := p
 			hooks.FilterContent = func(ctx context.Context, block *format.CoreContentBlock) bool {
 				if prev != nil && prev(ctx, block) {
 					return true
+				}
+				model := format.ModelAliasFromCoreHookContext(ctx)
+				if model == "" || !pluginImpl.EnabledForModel(model) {
+					return false
 				}
 				return f.FilterCoreContent(ctx, block)
 			}
@@ -511,13 +530,16 @@ func (r *Registry) CorePluginHooks() format.CorePluginHooks {
 		// RewriteMessages — only chain plugins enabled for this model.
 		if mw, ok := p.(MessageRewriter); ok {
 			prev := hooks.RewriteMessages
-			plugin := p.(Plugin) // for EnabledForModel check
+			pluginImpl := p
 			hooks.RewriteMessages = func(ctx context.Context, req *format.CoreRequest) {
 				if prev != nil {
 					prev(ctx, req)
 				}
+				if req == nil {
+					return
+				}
 				pluginCtx := &RequestContext{ModelAlias: req.Model}
-				if plugin.EnabledForModel(req.Model) {
+				if pluginImpl.EnabledForModel(req.Model) {
 					req.Messages = mw.RewriteMessages(pluginCtx, req.Messages)
 				}
 			}
@@ -541,9 +563,14 @@ func (r *Registry) CorePluginHooks() format.CorePluginHooks {
 		// RememberCoreContent
 		if rmem, ok := p.(CoreContentRememberer); ok {
 			prev := hooks.RememberContent
+			pluginImpl := p
 			hooks.RememberContent = func(ctx context.Context, content []format.CoreContentBlock) {
 				if prev != nil {
 					prev(ctx, content)
+				}
+				model := format.ModelAliasFromCoreHookContext(ctx)
+				if model == "" || !pluginImpl.EnabledForModel(model) {
+					return
 				}
 				rmem.RememberCoreContent(ctx, content)
 			}

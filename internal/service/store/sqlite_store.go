@@ -6,20 +6,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"moonbridge/internal/config"
 	"moonbridge/internal/db"
-
 )
 
 // SQLiteConfigStore implements ConfigStore backed by a SQLite database.
 type SQLiteConfigStore struct {
-	db      db.Store
-	logger  *slog.Logger
-	applyMu sync.Mutex
+	db             db.Store
+	logger         *slog.Logger
+	applyMu        sync.Mutex
 	extensionSpecs []config.ExtensionConfigSpec
 }
 
@@ -215,6 +215,8 @@ func buildSettings(fc config.FileConfig) map[string]string {
 		"mode":           fc.Mode,
 		"addr":           fc.Server.Addr,
 		"auth_token":     fc.Server.AuthToken,
+		"max_sessions":   fmt.Sprintf("%d", fc.Server.MaxSessions),
+		"session_ttl":    fc.Server.SessionTTL,
 		"trace_requests": jsonStr(fc.Trace.Enabled),
 		"log_level":      fc.Log.Level,
 		"log_format":     fc.Log.Format,
@@ -229,6 +231,7 @@ func buildSettings(fc config.FileConfig) map[string]string {
 	}
 	return settings
 }
+
 // --- LoadAll ---
 
 // LoadAll reads the complete configuration from the main tables.
@@ -422,6 +425,12 @@ func applySetting(fc *config.FileConfig, key, value string) {
 		fc.Server.Addr = value
 	case "auth_token":
 		fc.Server.AuthToken = value
+	case "max_sessions":
+		if v, err := strconv.Atoi(value); err == nil {
+			fc.Server.MaxSessions = v
+		}
+	case "session_ttl":
+		fc.Server.SessionTTL = value
 	case "trace_requests":
 		var enabled bool
 		if err := json.Unmarshal([]byte(value), &enabled); err == nil {
@@ -463,6 +472,7 @@ func applySetting(fc *config.FileConfig, key, value string) {
 		}
 	}
 }
+
 // --- StageChange ---
 
 func (s *SQLiteConfigStore) StageChange(ch ChangeRow) (int64, error) {
@@ -803,6 +813,7 @@ func (s *SQLiteConfigStore) deleteResourceTx(ctx context.Context, tx db.Tx, reso
 	}
 	return nil
 }
+
 // --- field helpers ---
 
 func addField(clauses *[]string, args *[]any, name string, fields map[string]any) {

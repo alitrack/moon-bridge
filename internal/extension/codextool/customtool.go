@@ -346,6 +346,28 @@ func InputSchemaWithFallback(params map[string]any, toolName string) map[string]
 	}
 }
 
+type applyPatchLine struct {
+	Op   string `json:"op"`
+	Text string `json:"text"`
+}
+
+type applyPatchHunk struct {
+	Context string           `json:"context"`
+	Lines   []applyPatchLine `json:"lines"`
+}
+
+type applyPatchSingleOp struct {
+	Type    string           `json:"type"`
+	Path    string           `json:"path"`
+	MoveTo  string           `json:"move_to"`
+	Content string           `json:"content"`
+	Hunks   []applyPatchHunk `json:"hunks"`
+}
+
+type applyPatchBatch struct {
+	Operations []applyPatchSingleOp `json:"operations"`
+}
+
 // ToolKindForGrammar returns the ToolKind for a custom tool grammar definition.
 func ToolKindForGrammar(grammar string, toolName string) (ToolKind, bool) {
 	if toolName == "local_shell" {
@@ -369,6 +391,72 @@ func AnnotateCoreTool(t *format.CoreTool, kind ToolKind, openAIName, namespace s
 	t.Extensions["codex_openai_name"] = openAIName
 	t.Extensions["codex_namespace"] = namespace
 }
+
+func appendApplyPatchOperation(b *strings.Builder, op applyPatchSingleOp) bool {
+	if strings.TrimSpace(op.Path) == "" {
+		return false
+	}
+
+	switch op.Type {
+	case "", "batch":
+		return false
+	case "add_file", "replace_file":
+		fmt.Fprintln(b, "*** Begin Patch")
+		if op.Type == "replace_file" {
+			fmt.Fprintf(b, "*** Update File: %s\n", op.Path)
+			if strings.TrimSpace(op.MoveTo) != "" {
+				fmt.Fprintf(b, "*** Move to: %s\n", op.MoveTo)
+			}
+			if op.Content != "" {
+				for _, line := range strings.Split(op.Content, "\n") {
+					fmt.Fprintf(b, "+%s\n", line)
+				}
+			}
+		} else {
+			fmt.Fprintf(b, "*** Add File: %s\n", op.Path)
+			if op.Content != "" {
+				for _, line := range strings.Split(op.Content, "\n") {
+					fmt.Fprintf(b, "+%s\n", line)
+				}
+			}
+		}
+		fmt.Fprintln(b, "*** End Patch")
+		return true
+	case "delete_file":
+		fmt.Fprintln(b, "*** Begin Patch")
+		fmt.Fprintf(b, "*** Delete File: %s\n", op.Path)
+		fmt.Fprintln(b, "*** End Patch")
+		return true
+	case "update_file":
+		fmt.Fprintln(b, "*** Begin Patch")
+		fmt.Fprintf(b, "*** Update File: %s\n", op.Path)
+		if strings.TrimSpace(op.MoveTo) != "" {
+			fmt.Fprintf(b, "*** Move to: %s\n", op.MoveTo)
+		}
+		for _, hunk := range op.Hunks {
+			if strings.TrimSpace(hunk.Context) == "" {
+				fmt.Fprintln(b, "@@")
+			} else {
+				fmt.Fprintf(b, "@@ %s\n", hunk.Context)
+			}
+			for _, line := range hunk.Lines {
+				switch line.Op {
+				case "add":
+					fmt.Fprintf(b, "+%s\n", line.Text)
+				case "remove":
+					fmt.Fprintf(b, "-%s\n", line.Text)
+				default:
+					fmt.Fprintf(b, " %s\n", line.Text)
+				}
+			}
+		}
+		fmt.Fprintln(b, "*** End Patch")
+		return true
+	default:
+		return false
+	}
+}
+
 // RebuildApplyPatchGrammar reconstructs the raw apply_patch grammar from
 // a proxy tool name and its structured input, for use as custom_tool_call.input.
 func RebuildApplyPatchGrammar(proxyName string, input json.RawMessage) string {
@@ -378,74 +466,52 @@ func RebuildApplyPatchGrammar(proxyName string, input json.RawMessage) string {
 	}
 	switch action {
 	case "add_file", "replace_file":
-		var p struct {
-			Path    string `json:"path"`
-			Content string `json:"content"`
-		}
-		if err := json.Unmarshal(input, &p); err != nil || p.Path == "" {
+		var p applyPatchSingleOp
+		if err := json.Unmarshal(input, &p); err != nil {
 			return string(input)
 		}
-		return fmt.Sprintf("*** Add File: %s\n%s\n*** End Patch", p.Path, p.Content)
-	case "delete_file":
-		var p struct{ Path string `json:"path"` }
-		if err := json.Unmarshal(input, &p); err != nil || p.Path == "" {
-			return string(input)
-		}
-		return fmt.Sprintf("*** Delete File: %s\n*** End Patch", p.Path)
-	case "update_file":
-		var p struct {
-			Path   string `json:"path"`
-			Hunks []map[string]any `json:"hunks"`
-		}
-		if err := json.Unmarshal(input, &p); err != nil || p.Path == "" {
-			return string(input)
-		}
+		p.Type = action
 		var b strings.Builder
-		fmt.Fprintf(&b, "*** Update File: %s\n", p.Path)
-		for _, hunk := range p.Hunks {
-			ctx, _ := hunk["context"].(string)
-			if ctx != "" {
-				fmt.Fprintf(&b, "*** Context: %s\n", ctx)
-			}
-			if lines, ok := hunk["lines"].([]any); ok {
-				for _, l := range lines {
-					if lm, ok := l.(map[string]any); ok {
-						op, _ := lm["op"].(string)
-						text, _ := lm["text"].(string)
-						switch op {
-						case "add":
-							b.WriteString("+ " + text + "\n")
-						case "remove":
-							b.WriteString("- " + text + "\n")
-						default:
-							b.WriteString("  " + text + "\n")
-						}
-					}
-				}
-			}
+		if !appendApplyPatchOperation(&b, p) {
+			return string(input)
 		}
-		fmt.Fprintf(&b, "*** End Patch")
 		return b.String()
-	case "batch":
-		var p struct {
-			Operations []map[string]any `json:"operations"`
+	case "delete_file":
+		var p applyPatchSingleOp
+		if err := json.Unmarshal(input, &p); err != nil {
+			return string(input)
 		}
+		p.Type = action
+		var b strings.Builder
+		if !appendApplyPatchOperation(&b, p) {
+			return string(input)
+		}
+		return b.String()
+	case "update_file":
+		var p applyPatchSingleOp
 		if err := json.Unmarshal(input, &p); err != nil {
 			return string(input)
 		}
 		var b strings.Builder
+		p.Type = action
+		if !appendApplyPatchOperation(&b, p) {
+			return string(input)
+		}
+		return b.String()
+	case "batch":
+		var p applyPatchBatch
+		if err := json.Unmarshal(input, &p); err != nil {
+			return string(input)
+		}
+		var b strings.Builder
+		wrote := false
 		for _, op := range p.Operations {
-			opType, _ := op["type"].(string)
-			path, _ := op["path"].(string)
-			switch opType {
-			case "add_file", "replace_file":
-				content, _ := op["content"].(string)
-				fmt.Fprintf(&b, "*** Add File: %s\n%s\n*** End Patch\n", path, content)
-			case "delete_file":
-				fmt.Fprintf(&b, "*** Delete File: %s\n*** End Patch\n", path)
-			case "update_file":
-				fmt.Fprintf(&b, "*** Update File: %s\n*** End Patch\n", path)
+			if appendApplyPatchOperation(&b, op) {
+				wrote = true
 			}
+		}
+		if !wrote {
+			return string(input)
 		}
 		return b.String()
 	default:
@@ -455,12 +521,15 @@ func RebuildApplyPatchGrammar(proxyName string, input json.RawMessage) string {
 
 // RebuildExecGrammar reconstructs the raw exec grammar from structured input.
 func RebuildExecGrammar(input json.RawMessage) string {
-	var p struct{ Source string `json:"source"` }
+	var p struct {
+		Source string `json:"source"`
+	}
 	if err := json.Unmarshal(input, &p); err != nil || p.Source == "" {
 		return string(input)
 	}
 	return p.Source
 }
+
 // RebuildGrammar auto-detects the tool type from the proxy tool name and
 // reconstructs the raw grammar input for custom_tool_call from structured arguments.
 func RebuildGrammar(proxyName string, input json.RawMessage) string {
@@ -479,5 +548,5 @@ func RebuildGrammar(proxyName string, input json.RawMessage) string {
 	if strings.HasPrefix(proxyName, "exec_") {
 		return RebuildExecGrammar(input)
 	}
-	return string(input)
+	return InputFromRaw(input)
 }

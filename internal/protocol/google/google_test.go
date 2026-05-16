@@ -755,7 +755,7 @@ func TestFromCoreRequest_MultiTurn(t *testing.T) {
 func TestFromCoreRequest_SystemInstruction(t *testing.T) {
 	adapter := newTestAdapter()
 	coreReq := &format.CoreRequest{
-		Model: "gemini-2.0-flash",
+		Model:  "gemini-2.0-flash",
 		System: []format.CoreContentBlock{{Type: "text", Text: "You are helpful."}},
 		Messages: []format.CoreMessage{
 			{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}},
@@ -880,7 +880,7 @@ func TestFromCoreRequest_Tools(t *testing.T) {
 func TestFromCoreRequest_SafetySettingsMap(t *testing.T) {
 	adapter := newTestAdapter()
 	coreReq := &format.CoreRequest{
-		Model: "test",
+		Model:          "test",
 		SafetySettings: map[string]any{"harassment": "block_only_high", "hate_speech": "block_medium_and_above"},
 		Messages: []format.CoreMessage{
 			{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}},
@@ -922,10 +922,10 @@ func TestFromCoreRequest_GenerationConfigMap(t *testing.T) {
 	coreReq := &format.CoreRequest{
 		Model: "test",
 		GenerationConfig: map[string]any{
-			"temperature":       float64(0.7),
+			"temperature":      float64(0.7),
 			"topP":             float64(0.9),
 			"topK":             float64(40),
-			"maxOutputTokens": float64(8192),
+			"maxOutputTokens":  float64(8192),
 			"stopSequences":    []any{"\n\n", "**"},
 			"responseMimeType": "text/plain",
 			"candidateCount":   float64(1),
@@ -973,7 +973,7 @@ func TestFromCoreRequest_GenerationConfigMap_NonStringThreshold(t *testing.T) {
 
 	// Non-string threshold should be silently skipped.
 	coreReq := &format.CoreRequest{
-		Model: "test",
+		Model:          "test",
 		SafetySettings: map[string]any{"harassment": float64(3)},
 		Messages: []format.CoreMessage{
 			{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}},
@@ -1311,11 +1311,42 @@ func TestToCoreResponse_ToolCallResponse(t *testing.T) {
 	if blocks[1].ToolName != "get_weather" {
 		t.Errorf("ToolName = %q", blocks[1].ToolName)
 	}
-	if blocks[1].ToolUseID != "get_weather" {
+	if blocks[1].ToolUseID != "get_weather__call_1" {
 		t.Errorf("ToolUseID = %q", blocks[1].ToolUseID)
 	}
 	if string(blocks[1].ToolInput) != `{"loc":"NYC"}` {
 		t.Errorf("ToolInput = %s", string(blocks[1].ToolInput))
+	}
+}
+
+func TestToCoreResponse_ToolCallResponse_DuplicateFunctionNameGetsUniqueIDs(t *testing.T) {
+	adapter := newTestAdapter()
+	geminiResp := &google.GenerateContentResponse{
+		Candidates: []google.Candidate{{
+			Index: 0,
+			Content: google.Content{Role: "model", Parts: []google.Part{
+				{FunctionCall: &google.FunctionCall{Name: "get_weather", Args: json.RawMessage(`{"loc":"NYC"}`)}},
+				{FunctionCall: &google.FunctionCall{Name: "get_weather", Args: json.RawMessage(`{"loc":"Paris"}`)}},
+			}},
+			FinishReason: "STOP",
+		}},
+	}
+	result, err := adapter.ToCoreResponse(context.Background(), geminiResp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks := result.Messages[0].Content
+	if len(blocks) != 2 {
+		t.Fatalf("Content blocks: got %d, want 2", len(blocks))
+	}
+	if blocks[0].ToolUseID == blocks[1].ToolUseID {
+		t.Fatalf("duplicate ToolUseID: %q", blocks[0].ToolUseID)
+	}
+	if blocks[0].ToolUseID != "get_weather__call_1" {
+		t.Errorf("first ToolUseID = %q, want get_weather__call_1", blocks[0].ToolUseID)
+	}
+	if blocks[1].ToolUseID != "get_weather__call_2" {
+		t.Errorf("second ToolUseID = %q, want get_weather__call_2", blocks[1].ToolUseID)
 	}
 }
 
@@ -1339,7 +1370,7 @@ func TestToCoreStream_SingleCandidate(t *testing.T) {
 		Candidates: []google.Candidate{{Index: 0, Content: google.Content{Parts: []google.Part{{Text: "Hel"}}}}},
 	}
 	src <- google.GenerateContentResponse{
-		Candidates: []google.Candidate{{Index: 0, Content: google.Content{Parts: []google.Part{{Text: "Hello world"}}}, FinishReason: "STOP"}},
+		Candidates:    []google.Candidate{{Index: 0, Content: google.Content{Parts: []google.Part{{Text: "Hello world"}}}, FinishReason: "STOP"}},
 		UsageMetadata: &google.UsageMetadata{PromptTokenCount: 5, CandidatesTokenCount: 10, TotalTokenCount: 15},
 	}
 	close(src)
@@ -1602,8 +1633,8 @@ func TestFromCoreRequest_EmptyToolResult(t *testing.T) {
 				Role: "user",
 				Content: []format.CoreContentBlock{
 					{
-						Type:             "tool_result",
-						ToolUseID:        "call_xyz",
+						Type:              "tool_result",
+						ToolUseID:         "call_xyz",
 						ToolResultContent: []format.CoreContentBlock{},
 					},
 				},
@@ -1667,13 +1698,13 @@ func TestFromCoreRequest_GenerationConfigMap_TypeVariants(t *testing.T) {
 	coreReq := &format.CoreRequest{
 		Model: "test",
 		GenerationConfig: map[string]any{
-			"temperature":       int(8) / 10, // int → toFloat64
-			"topP":             json.Number("0.85"), // json.Number → toFloat64
-			"maxOutputTokens": int(4096), // json.Number → toInt
-			"candidateCount":   json.Number("2"),
-			"candidate_count_int64": int64(1), // int64 → toInt
-			"stopSequences":    []string{"END"}, // []string → toStringSlice
-			"responseMimeType": "application/json",
+			"temperature":           int(8) / 10,         // int → toFloat64
+			"topP":                  json.Number("0.85"), // json.Number → toFloat64
+			"maxOutputTokens":       int(4096),           // json.Number → toInt
+			"candidateCount":        json.Number("2"),
+			"candidate_count_int64": int64(1),        // int64 → toInt
+			"stopSequences":         []string{"END"}, // []string → toStringSlice
+			"responseMimeType":      "application/json",
 		},
 		Messages: []format.CoreMessage{
 			{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}},
@@ -1700,10 +1731,10 @@ func TestFromCoreRequest_GenerationConfigMap_TypeVariants(t *testing.T) {
 	if gc.MaxOutputTokens != 4096 {
 		t.Errorf("MaxOutputTokens = %d, want 4096", gc.MaxOutputTokens)
 	}
-		// candidate_count from int64
-		if gc.CandidateCount != 2 {
-			t.Errorf("CandidateCount = %d, want 2", gc.CandidateCount)
-		}
+	// candidate_count from int64
+	if gc.CandidateCount != 2 {
+		t.Errorf("CandidateCount = %d, want 2", gc.CandidateCount)
+	}
 	// stop_sequences from []string
 	if len(gc.StopSequences) != 1 || gc.StopSequences[0] != "END" {
 		t.Errorf("StopSequences = %v", gc.StopSequences)
@@ -1716,9 +1747,9 @@ func TestFromCoreRequest_GenerationConfigMap_DefaultBranch(t *testing.T) {
 	coreReq := &format.CoreRequest{
 		Model: "test",
 		GenerationConfig: map[string]any{
-			"temperature":       "invalid", // string → toFloat64 default → false → skipped
+			"temperature":     "invalid", // string → toFloat64 default → false → skipped
 			"maxOutputTokens": "invalid", // string → toInt default → false → skipped
-			"unknown_key":       "should be ignored",
+			"unknown_key":     "should be ignored",
 		},
 		Messages: []format.CoreMessage{
 			{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}},
@@ -2019,8 +2050,8 @@ func TestFromCoreRequest_GenerationConfigMap_Int64AndDefault(t *testing.T) {
 	coreReq := &format.CoreRequest{
 		Model: "test",
 		GenerationConfig: map[string]any{
-			"topK":          int64(30),          // int64 → toFloat64
-			"stopSequences": 42,                 // int (not []any or []string) → toStringSlice default
+			"topK":          int64(30), // int64 → toFloat64
+			"stopSequences": 42,        // int (not []any or []string) → toStringSlice default
 		},
 		Messages: []format.CoreMessage{
 			{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}},

@@ -44,6 +44,16 @@ func (p *testMutator) MutateRequest(_ *plugin.RequestContext, req *format.CoreRe
 	req.Temperature = &v
 }
 
+type testCoreRequestMutator struct {
+	testPlugin
+	called int
+}
+
+func (p *testCoreRequestMutator) MutateCoreRequest(_ context.Context, req *format.CoreRequest) {
+	p.called++
+	req.Metadata = map[string]any{"mutated": true}
+}
+
 type testToolInjector struct {
 	testPlugin
 }
@@ -61,6 +71,25 @@ func (p *testContentFilter) FilterContent(_ *plugin.RequestContext, block format
 		return true
 	}
 	return false
+}
+
+type testCoreContentFilter struct {
+	testPlugin
+	called int
+}
+
+func (p *testCoreContentFilter) FilterCoreContent(_ context.Context, block *format.CoreContentBlock) bool {
+	p.called++
+	return block != nil && block.Type == "reasoning"
+}
+
+type testCoreContentRememberer struct {
+	testPlugin
+	called int
+}
+
+func (p *testCoreContentRememberer) RememberCoreContent(_ context.Context, _ []format.CoreContentBlock) {
+	p.called++
 }
 
 type testErrorTransformer struct {
@@ -258,6 +287,63 @@ func TestRegistryNilSafe(t *testing.T) {
 	r.OnStreamComplete("m", nil, "", nil)
 	if r.HasEnabled("m") {
 		t.Fatal("nil registry should not have enabled plugins")
+	}
+}
+
+func TestCorePluginHooksMutateCoreRequestHonorsEnabledForModel(t *testing.T) {
+	r := plugin.NewRegistry(nil)
+	disabled := &testCoreRequestMutator{testPlugin: testPlugin{name: "disabled_mutator", enabled: false}}
+	enabled := &testCoreRequestMutator{testPlugin: testPlugin{name: "enabled_mutator", enabled: true}}
+	r.Register(disabled)
+	r.Register(enabled)
+
+	req := &format.CoreRequest{Model: "test-model"}
+	hooks := r.CorePluginHooks()
+	hooks.MutateCoreRequest(context.Background(), req)
+
+	if disabled.called != 0 {
+		t.Fatalf("disabled mutator called %d times", disabled.called)
+	}
+	if enabled.called != 1 {
+		t.Fatalf("enabled mutator called %d times", enabled.called)
+	}
+	if req.Metadata == nil || req.Metadata["mutated"] != true {
+		t.Fatalf("request metadata not mutated as expected: %+v", req.Metadata)
+	}
+}
+
+func TestCorePluginHooksFilterAndRememberRequireModelContext(t *testing.T) {
+	r := plugin.NewRegistry(nil)
+	enabledFilter := &testCoreContentFilter{testPlugin: testPlugin{name: "enabled_filter", enabled: true}}
+	enabledRemember := &testCoreContentRememberer{testPlugin: testPlugin{name: "enabled_remember", enabled: true}}
+	r.Register(enabledFilter)
+	r.Register(enabledRemember)
+
+	hooks := r.CorePluginHooks()
+	block := &format.CoreContentBlock{Type: "reasoning"}
+	content := []format.CoreContentBlock{{Type: "text", Text: "hello"}}
+
+	if hooks.FilterContent(context.Background(), block) {
+		t.Fatal("FilterContent should not run without model context")
+	}
+	hooks.RememberContent(context.Background(), content)
+	if enabledFilter.called != 0 {
+		t.Fatalf("filter called without model context: %d", enabledFilter.called)
+	}
+	if enabledRemember.called != 0 {
+		t.Fatalf("remember called without model context: %d", enabledRemember.called)
+	}
+
+	ctx := format.WithCoreHookModelAlias(context.Background(), "test-model")
+	if !hooks.FilterContent(ctx, block) {
+		t.Fatal("FilterContent should run and skip reasoning block with model context")
+	}
+	hooks.RememberContent(ctx, content)
+	if enabledFilter.called != 1 {
+		t.Fatalf("filter called %d times with model context", enabledFilter.called)
+	}
+	if enabledRemember.called != 1 {
+		t.Fatalf("remember called %d times with model context", enabledRemember.called)
 	}
 }
 

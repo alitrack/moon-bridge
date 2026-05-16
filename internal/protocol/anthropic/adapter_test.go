@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/format"
+	"moonbridge/internal/protocol/anthropic"
 )
 
 // ---------------------------------------------------------------------------
@@ -24,9 +24,6 @@ func (n noopCacheManager) UpdateRegistry(_ context.Context, _, _ string, _ anthr
 func newTestAdapter() *anthropic.AnthropicProviderAdapter {
 	return anthropic.NewAnthropicProviderAdapter(0, noopCacheManager{}, format.CorePluginHooks{})
 }
-
-
-
 
 func TestFromCoreRequest_BasicTextMessage(t *testing.T) {
 	// 测试纯文本 CoreRequest → *anthropic.MessageRequest
@@ -73,7 +70,7 @@ func TestFromCoreRequest_SystemField(t *testing.T) {
 	adapter := newTestAdapter()
 
 	coreReq := &format.CoreRequest{
-		Model: "claude-sonnet-4",
+		Model:  "claude-sonnet-4",
 		System: []format.CoreContentBlock{{Type: "text", Text: "You are helpful."}},
 		Messages: []format.CoreMessage{
 			{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}},
@@ -412,6 +409,43 @@ func TestToCoreResponse_BasicText(t *testing.T) {
 	}
 }
 
+func TestToCoreResponse_BasicTextValueResponse(t *testing.T) {
+	adapter := newTestAdapter()
+
+	anthResp := anthropic.MessageResponse{
+		ID:   "msg_value_123",
+		Type: "message",
+		Role: "assistant",
+		Content: []anthropic.ContentBlock{
+			{Type: "text", Text: "Hello from value"},
+		},
+		Model:      "claude-sonnet-4",
+		StopReason: "end_turn",
+		Usage:      anthropic.Usage{InputTokens: 7, OutputTokens: 11},
+	}
+
+	result, err := adapter.ToCoreResponse(context.Background(), anthResp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.ID != "msg_value_123" {
+		t.Errorf("ID = %q", result.ID)
+	}
+	if result.Model != "claude-sonnet-4" {
+		t.Errorf("Model = %q", result.Model)
+	}
+	if len(result.Messages) != 1 {
+		t.Fatalf("got %d messages, want 1", len(result.Messages))
+	}
+	if len(result.Messages[0].Content) != 1 {
+		t.Fatalf("got %d content blocks, want 1", len(result.Messages[0].Content))
+	}
+	if result.Messages[0].Content[0].Text != "Hello from value" {
+		t.Errorf("text = %q", result.Messages[0].Content[0].Text)
+	}
+}
+
 func TestToCoreResponse_Incomplete(t *testing.T) {
 	adapter := newTestAdapter()
 
@@ -542,7 +576,7 @@ func TestFromCoreRequest_PluginHooksCalled(t *testing.T) {
 			req.Model = "mutated-model"
 		},
 	}
-		adapter := anthropic.NewAnthropicProviderAdapter(0, noopCacheManager{}, hooks)
+	adapter := anthropic.NewAnthropicProviderAdapter(0, noopCacheManager{}, hooks)
 
 	coreReq := &format.CoreRequest{
 		Model: "claude-sonnet-4",
@@ -617,8 +651,8 @@ func TestFromCoreRequest_MergesConsecutiveToolResultMessages(t *testing.T) {
 				Role: "user",
 				Content: []format.CoreContentBlock{
 					{
-						Type:             "tool_result",
-						ToolUseID:        "call_1",
+						Type:      "tool_result",
+						ToolUseID: "call_1",
 						ToolResultContent: []format.CoreContentBlock{
 							{Type: "text", Text: "Sunny, 25°C"},
 						},
@@ -629,8 +663,8 @@ func TestFromCoreRequest_MergesConsecutiveToolResultMessages(t *testing.T) {
 				Role: "tool",
 				Content: []format.CoreContentBlock{
 					{
-						Type:             "tool_result",
-						ToolUseID:        "call_2",
+						Type:      "tool_result",
+						ToolUseID: "call_2",
 						ToolResultContent: []format.CoreContentBlock{
 							{Type: "text", Text: "Windy, 15°C"},
 						},

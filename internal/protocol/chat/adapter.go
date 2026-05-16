@@ -25,11 +25,11 @@ import (
 // Only references: config, format, and chat types.
 type ChatProviderAdapter struct {
 	cfgMaxTokens int
-	client *Client
-	hooks format.CorePluginHooks
+	client       *Client
+	hooks        format.CorePluginHooks
 
-	streamMu      sync.Mutex
-	streamEvents  []ChatStreamChunk
+	streamMu     sync.Mutex
+	streamEvents []ChatStreamChunk
 }
 
 // NewChatProviderAdapter creates a new ChatProviderAdapter.
@@ -39,8 +39,8 @@ type ChatProviderAdapter struct {
 func NewChatProviderAdapter(cfgMaxTokens int, client *Client, hooks format.CorePluginHooks) *ChatProviderAdapter {
 	return &ChatProviderAdapter{
 		cfgMaxTokens: cfgMaxTokens,
-		client: client,
-		hooks:  hooks.WithDefaults(),
+		client:       client,
+		hooks:        hooks.WithDefaults(),
 	}
 }
 
@@ -241,13 +241,14 @@ func (a *ChatProviderAdapter) ToCoreStream(ctx context.Context, src any) (<-chan
 
 		// Per-choice state for streaming.
 		type choiceState struct {
-			started    bool
-			blockIndex int // monotonically increasing content block index
-			hasReasoning bool   // whether a reasoning block is active
-				reasonIndex  int   // block index for the reasoning content block
-			toolCallIdx  int   // next tool call content block index (starts after text block)
-			callStarted map[int]bool // tracks which tool call indices have been started
-			reasoningContent string // accumulated reasoning content for the current reasoning block
+			started          bool
+			blockIndex       int          // monotonically increasing content block index
+			hasReasoning     bool         // whether a reasoning block is active
+			reasonIndex      int          // block index for the reasoning content block
+			toolCallIdx      int          // next tool call content block index (starts after text block)
+			callStarted      map[int]bool // tracks which tool call indices have been started
+			toolCallSlot     map[int]int  // tool_call delta index -> content block index
+			reasoningContent string       // accumulated reasoning content for the current reasoning block
 		}
 		choices := make(map[int]*choiceState)
 		var seqNum int64
@@ -335,8 +336,8 @@ func (a *ChatProviderAdapter) ToCoreStream(ctx context.Context, src any) (<-chan
 							state.reasonIndex = state.blockIndex + 1
 							state.blockIndex = state.reasonIndex
 							emit(format.CoreStreamEvent{
-								Type:  format.CoreContentBlockDone,
-								Index: state.blockIndex,
+								Type:        format.CoreContentBlockDone,
+								Index:       state.blockIndex,
 								ChoiceIndex: &ci,
 							})
 							emit(format.CoreStreamEvent{
@@ -360,11 +361,11 @@ func (a *ChatProviderAdapter) ToCoreStream(ctx context.Context, src any) (<-chan
 					// Transition from reasoning block to text block.
 					if sc.Delta.Content != "" && state.hasReasoning {
 						emit(format.CoreStreamEvent{
-							Type:  format.CoreContentBlockDone,
-							Index: state.reasonIndex,
+							Type:        format.CoreContentBlockDone,
+							Index:       state.reasonIndex,
 							ChoiceIndex: &ci,
 							ContentBlock: &format.CoreContentBlock{
-								Type: "reasoning",
+								Type:          "reasoning",
 								ReasoningText: state.reasoningContent,
 							},
 						})
@@ -390,39 +391,52 @@ func (a *ChatProviderAdapter) ToCoreStream(ctx context.Context, src any) (<-chan
 					}
 
 					// Emit tool call content blocks and args deltas.
-					for _, tc := range sc.Delta.ToolCalls {
-						// Emit content_block.started for first occurrence of each tool call.
-						if tc.ID != "" {
-							if state.callStarted == nil {
-								state.callStarted = make(map[int]bool)
-								// Start tool call indices after the current text/reasoning block.
-								state.toolCallIdx = state.blockIndex + 1
-							}
-							if !state.callStarted[state.toolCallIdx] {
-								state.callStarted[state.toolCallIdx] = true
-								emit(format.CoreStreamEvent{
-									Type:        format.CoreContentBlockStarted,
-									Index:       state.toolCallIdx,
-									ChoiceIndex: &ci,
-									ContentBlock: &format.CoreContentBlock{
-										Type:      "tool_use",
-										ToolUseID: tc.ID,
-										ToolName:  tc.Function.Name,
-									},
-								})
-								state.toolCallIdx++
-							}
+					for toolPos, tc := range sc.Delta.ToolCalls {
+						callPos := toolPos
+						if tc.Index != nil && *tc.Index >= 0 {
+							callPos = *tc.Index
+						}
+						if state.callStarted == nil {
+							state.callStarted = make(map[int]bool)
+							// Start tool call indices after the current text/reasoning block.
+							state.toolCallIdx = state.blockIndex + 1
+						}
+						if state.toolCallSlot == nil {
+							state.toolCallSlot = make(map[int]int)
+						}
+						slot, hasSlot := state.toolCallSlot[callPos]
+						// Emit content_block.started for first occurrence of each tool call slot.
+						if !hasSlot {
+							slot = state.toolCallIdx
+							state.toolCallSlot[callPos] = slot
+							state.toolCallIdx++
+						}
+						if !state.callStarted[slot] && (tc.ID != "" || tc.Function.Name != "") {
+							state.callStarted[slot] = true
+							emit(format.CoreStreamEvent{
+								Type:        format.CoreContentBlockStarted,
+								Index:       slot,
+								ChoiceIndex: &ci,
+								ContentBlock: &format.CoreContentBlock{
+									Type:      "tool_use",
+									ToolUseID: tc.ID,
+									ToolName:  tc.Function.Name,
+								},
+							})
 						}
 						// Skip empty argument deltas (avoids accumulating "" at the start).
 						// Decode each JSON string chunk to get the actual content (strips surrounding quotes).
 						// Raw bytes include JSON string quotes (e.g. "" -> empty, "{" -> {, "\"" -> ").
+						if !state.callStarted[slot] {
+							continue
+						}
 						if len(tc.Function.Arguments) > 0 {
 							var decoded string
 							if err := json.Unmarshal(tc.Function.Arguments, &decoded); err == nil {
 								if decoded != "" {
 									emit(format.CoreStreamEvent{
 										Type:        format.CoreToolCallArgsDelta,
-										Index:       state.toolCallIdx - 1,
+										Index:       slot,
 										Delta:       decoded,
 										ChoiceIndex: &ci,
 									})
@@ -430,7 +444,7 @@ func (a *ChatProviderAdapter) ToCoreStream(ctx context.Context, src any) (<-chan
 							} else {
 								emit(format.CoreStreamEvent{
 									Type:        format.CoreToolCallArgsDelta,
-									Index:       state.toolCallIdx - 1,
+									Index:       slot,
 									Delta:       string(tc.Function.Arguments),
 									ChoiceIndex: &ci,
 								})
@@ -448,7 +462,7 @@ func (a *ChatProviderAdapter) ToCoreStream(ctx context.Context, src any) (<-chan
 								StopReason:  stopReason,
 								ChoiceIndex: &ci,
 								ContentBlock: &format.CoreContentBlock{
-									Type: "reasoning",
+									Type:          "reasoning",
 									ReasoningText: state.reasoningContent,
 								},
 							})
@@ -462,15 +476,18 @@ func (a *ChatProviderAdapter) ToCoreStream(ctx context.Context, src any) (<-chan
 							})
 						}
 						// Complete tool call blocks.
-						for idx := range state.callStarted {
+						for idx := state.blockIndex + 1; idx < state.toolCallIdx; idx++ {
+							if !state.callStarted[idx] {
+								continue
+							}
 							emit(format.CoreStreamEvent{
-								Type:  format.CoreToolCallArgsDone,
-								Index: idx,
+								Type:        format.CoreToolCallArgsDone,
+								Index:       idx,
 								ChoiceIndex: &ci,
 							})
 							emit(format.CoreStreamEvent{
-								Type:  format.CoreContentBlockDone,
-								Index: idx,
+								Type:        format.CoreContentBlockDone,
+								Index:       idx,
 								ChoiceIndex: &ci,
 							})
 						}
@@ -693,8 +710,8 @@ func (a *ChatProviderAdapter) toChatToolChoice(tc format.CoreToolChoice) json.Ra
 				"type": "function",
 				"function": map[string]string{
 					"name": tc.Name,
-			},
-		}
+				},
+			}
 			data, _ := json.Marshal(choice)
 			return data
 		}
@@ -706,8 +723,8 @@ func (a *ChatProviderAdapter) toChatToolChoice(tc format.CoreToolChoice) json.Ra
 				"type": "function",
 				"function": map[string]string{
 					"name": tc.Name,
-			},
-		}
+				},
+			}
 			data, _ := json.Marshal(choice)
 			return data
 		}

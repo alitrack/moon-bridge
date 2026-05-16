@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/config"
+	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/format"
 )
 
@@ -24,8 +24,9 @@ type Config struct {
 // Plugin injects the Visual tools for models that opt in.
 type Plugin struct {
 	plugin.BasePlugin
-	isEnabled EnabledFunc
-	pluginCfg config.PluginConfig
+	isEnabled     EnabledFunc
+	pluginCfg     config.PluginConfig
+	currentConfig func() config.Config
 }
 
 func NewPlugin(isEnabled ...EnabledFunc) *Plugin {
@@ -42,10 +43,14 @@ func (p *Plugin) ConfigSpecs() []config.ExtensionConfigSpec { return ConfigSpecs
 
 func (p *Plugin) Init(ctx plugin.PluginContext) error {
 	p.pluginCfg = config.PluginFromGlobalConfig(&ctx.AppConfig)
+	p.currentConfig = ctx.CurrentConfig
 	return nil
 }
 
 func (p *Plugin) EnabledForModel(model string) bool {
+	if p.currentConfig != nil {
+		return p.currentConfig().ExtensionEnabled(PluginName, model)
+	}
 	if p.isEnabled != nil {
 		return p.isEnabled(model)
 	}
@@ -103,6 +108,19 @@ func ConfigForModel(pluginCfg config.PluginConfig, modelAlias string) (Config, b
 	return cfg.Normalized(), true
 }
 
+// ConfigForModelFromResolvedConfig resolves visual config using the full
+// extension scope precedence from config.Config.
+func ConfigForModelFromResolvedConfig(fullCfg config.Config, modelAlias string) (Config, bool) {
+	if !fullCfg.ExtensionEnabled(PluginName, modelAlias) {
+		return Config{}, false
+	}
+	cfg, err := decodeVisualConfig(fullCfg, modelAlias)
+	if err != nil {
+		return Config{}, false
+	}
+	return cfg, true
+}
+
 func pluginExtensionEnabled(pluginCfg config.PluginConfig, name string) bool {
 	if setting, ok := pluginCfg.Extensions[name]; ok && setting.Enabled != nil {
 		return *setting.Enabled
@@ -121,7 +139,6 @@ func (cfg Config) Normalized() Config {
 	}
 	return cfg
 }
-
 
 // decodeVisualConfig decodes the visual extension config for a model alias.
 func decodeVisualConfig(fullCfg config.Config, modelAlias string) (Config, error) {

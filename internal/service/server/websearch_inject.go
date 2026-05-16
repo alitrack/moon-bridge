@@ -88,7 +88,7 @@ func injectChatSearchTools(req *chat.ChatRequest, firecrawlKey string) {
 			},
 		})
 	}
-		req.Tools = append(req.Tools, tools...)
+	req.Tools = append(req.Tools, tools...)
 }
 
 // executeChatSearchLoop implements the multi-round search loop for Chat protocol.
@@ -106,7 +106,7 @@ func (s *Server) executeChatSearchLoop(
 		firecrawl = websearch.NewFirecrawlClient(firecrawlKey)
 	}
 
-	for round := 0; round <= maxRounds; round++ {
+	for round := 0; round < maxRounds; round++ {
 		resp, err := client.CreateChat(ctx, req)
 		if err != nil {
 			return nil, err
@@ -294,7 +294,7 @@ func (s *Server) executeGoogleSearchLoop(
 		firecrawl = websearch.NewFirecrawlClient(firecrawlKey)
 	}
 
-	for round := 0; round <= maxRounds; round++ {
+	for round := 0; round < maxRounds; round++ {
 		resp, err := client.GenerateContent(ctx, model, req)
 		if err != nil {
 			return nil, err
@@ -499,7 +499,8 @@ func (s *Server) chatSearchBufferedStream(
 	}
 
 	allEvents := make([]chat.ChatStreamChunk, 0, 128)
-	for round := 0; round <= maxRounds; round++ {
+	exhausted := true
+	for round := 0; round < maxRounds; round++ {
 		stream, err := client.StreamChat(ctx, req)
 		if err != nil {
 			return nil, err
@@ -510,10 +511,11 @@ func (s *Server) chatSearchBufferedStream(
 			return nil, roundErr
 		}
 
-		// Check for tool calls in the last chunk with choices.
-		toolCalls := lastChunkToolCalls(events)
+		// Reconstruct tool calls from all streaming chunks.
+		toolCalls := collectStreamToolCalls(events)
 		if len(toolCalls) == 0 {
 			allEvents = append(allEvents, events...)
+			exhausted = false
 			break
 		}
 
@@ -531,10 +533,12 @@ func (s *Server) chatSearchBufferedStream(
 		}
 		if len(searchCalls) == 0 {
 			allEvents = append(allEvents, events...)
+			exhausted = false
 			break
 		}
 		if len(nonSearchCalls) > 0 {
 			allEvents = append(allEvents, events...)
+			exhausted = false
 			break
 		}
 
@@ -557,14 +561,17 @@ func (s *Server) chatSearchBufferedStream(
 		asstContent := collectChatStreamContent(events)
 		reasoningContent := collectChatStreamReasoning(events)
 		req.Messages = append(req.Messages, chat.ChatMessage{
-			Role:      "assistant",
-			Content:   asstContent,
-			ToolCalls: toolCalls,
+			Role:             "assistant",
+			Content:          asstContent,
+			ToolCalls:        toolCalls,
 			ReasoningContent: reasoningContent,
 		})
 		req.Messages = append(req.Messages, toolResultMsgs...)
 
 		log.Debug("Chat 流式搜索轮次", "round", round+1, "tools_executed", len(searchCalls))
+	}
+	if exhausted && maxRounds > 0 {
+		return nil, fmt.Errorf("chat streaming search loop exceeded max rounds (%d)", maxRounds)
 	}
 
 	// Return all events as a single channel.
@@ -592,17 +599,91 @@ func collectChatStream(ctx context.Context, stream <-chan chat.ChatStreamChunk) 
 	}
 }
 
-// lastChunkToolCalls extracts tool calls from the final chunk that has choices.
-func lastChunkToolCalls(events []chat.ChatStreamChunk) []chat.ToolCall {
-	// Look in reverse for the last chunk with tool calls.
-	for i := len(events) - 1; i >= 0; i-- {
-		for _, sc := range events[i].Choices {
-			if len(sc.Delta.ToolCalls) > 0 {
-				return sc.Delta.ToolCalls
+// collectStreamToolCalls reconstructs tool calls across streaming chunks.
+// Tool call fields (id/name/arguments) may arrive in separate chunks.
+func collectStreamToolCalls(events []chat.ChatStreamChunk) []chat.ToolCall {
+	choiceCalls := make(map[int][]chat.ToolCall)
+	choicePosMap := make(map[int]map[int]int) // choice -> tool call position -> slot index
+	choiceOrder := make([]int, 0, 2)
+
+	for _, ev := range events {
+		for _, sc := range ev.Choices {
+			ci := sc.Index
+			if _, ok := choicePosMap[ci]; !ok {
+				choicePosMap[ci] = make(map[int]int)
+				choiceOrder = append(choiceOrder, ci)
+			}
+			for idx, tc := range sc.Delta.ToolCalls {
+				pos := idx
+				if tc.Index != nil && *tc.Index >= 0 {
+					pos = *tc.Index
+				}
+
+				slot, exists := choicePosMap[ci][pos]
+				if !exists {
+					slot = len(choiceCalls[ci])
+					choicePosMap[ci][pos] = slot
+					choiceCalls[ci] = append(choiceCalls[ci], chat.ToolCall{
+						Type:     "function",
+						Function: chat.ToolCallFunc{},
+					})
+				}
+
+				current := choiceCalls[ci][slot]
+				if tc.ID != "" {
+					current.ID = tc.ID
+				}
+				if tc.Type != "" {
+					current.Type = tc.Type
+				}
+				if tc.Function.Name != "" {
+					current.Function.Name = tc.Function.Name
+				}
+				if len(tc.Function.Arguments) > 0 {
+					existing := string(current.Function.Arguments)
+					current.Function.Arguments = json.RawMessage(appendToolCallArgs(existing, tc.Function.Arguments))
+				}
+				choiceCalls[ci][slot] = current
 			}
 		}
 	}
+
+	for _, ci := range choiceOrder {
+		merged := choiceCalls[ci]
+		if len(merged) == 0 {
+			continue
+		}
+		return merged
+	}
 	return nil
+}
+
+// appendToolCallArgs appends delta arguments to the current accumulated JSON text.
+func appendToolCallArgs(current string, delta json.RawMessage) string {
+	if len(delta) == 0 {
+		return current
+	}
+	decoded := unquoteRawJSON(delta)
+	if len(decoded) == 0 {
+		return current
+	}
+	part := string(decoded)
+	if current == "" {
+		return part
+	}
+	// Prefer the newer payload when both sides are complete JSON values.
+	// Some providers emit snapshots instead of strict deltas.
+	if json.Valid([]byte(current)) && json.Valid([]byte(part)) {
+		return part
+	}
+	// Handle cumulative chunks (new part already contains old prefix/suffix).
+	if strings.HasPrefix(part, current) {
+		return part
+	}
+	if strings.HasSuffix(current, part) {
+		return current
+	}
+	return current + part
 }
 
 // collectChatStreamContent builds the assistant's full text content from all chunks.
@@ -627,7 +708,6 @@ func collectChatStreamReasoning(events []chat.ChatStreamChunk) string {
 	}
 	return sb.String()
 }
-
 
 // unquoteRawJSON unwraps a JSON-string-encoded value.
 // Chat API returns function.arguments as a quoted JSON string. When stored as
