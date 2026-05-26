@@ -33,6 +33,40 @@ go run ./cmd/moonbridge -config config.yml
 - **Web Search 注入**：自动/注入模式，支持 Tavily、Firecrawl
 - **Prompt 缓存**：explicit / automatic / hybrid 三种模式
 
+## 内置扩展
+
+所有扩展通过 `config.yml` 的 `extensions` 字段启用，支持 Global / Provider / Model / Route 四级作用域。
+
+| 扩展 | 类型 | 功能 |
+|------|------|------|
+| `codex_tool_proxy` | ToolInjector | 为 Codex 注入 `apply_patch` 等工具代理 |
+| `deepseek_v4` | ReasoningExtractor | DeepSeek V4/V3 thinking/reasoning 提取与转换 |
+| `web_fetch` | ToolInjector + MessageRewriter | 注入 `web_fetch(url)` 工具，代理侧通过 Jina Reader 抓取网页 Markdown，绕过 Codex 沙箱的 HTTP 限制 |
+| `circuit_breaker` | RequestMutator | 按会话统计连续 tool_use 调用次数，超过阈值注入警告或强制终止，防止模型陷入死循环 |
+| `response_store` | ResponsePostProcessor | 缓存上游响应，当请求携带 `previous_response_id` 时自动桥接上次 assistant 输出到新请求 Input |
+| `kimi_workaround` | InputPreprocessor | Kimi 模型兼容处理 |
+| `visual` | ContentFilter | 视觉/图片内容过滤 |
+| `db_sqlite` / `db_d1` | Provider | SQLite / Cloudflare D1 持久化存储 |
+| `metrics` | RequestCompletionHook | Token 用量与费用统计 |
+
+### 配置示例
+
+```yaml
+extensions:
+  web_fetch:
+    enabled: true
+  circuit_breaker:
+    enabled: true
+    config:
+      max_consecutive_tools: 20
+      hard_limit: 30
+  response_store:
+    enabled: true
+    config:
+      ttl_seconds: 3600
+      max_entries: 500
+```
+
 ## 三种工作模式
 
 | 模式 | 行为 |
