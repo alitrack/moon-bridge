@@ -4,14 +4,15 @@
 package circuitbreaker
 
 import (
-	"sync"
-
 	"moonbridge/internal/config"
 	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/format"
 )
 
 const PluginName = "circuit_breaker"
+
+// sessionStateKey is used to store per-session state in RequestContext.SessionData.
+const sessionStateKey = "circuit_breaker_state"
 
 type Config struct {
 	MaxConsecutiveTools int `json:"max_consecutive_tools,omitempty" yaml:"max_consecutive_tools"`
@@ -28,12 +29,10 @@ type Plugin struct {
 	cfg           *Config
 	appCfg        config.Config
 	currentConfig func() config.Config
-	mu            sync.Mutex
-	sessions      map[string]*sessionState
 }
 
 func NewPlugin() *Plugin {
-	return &Plugin{sessions: make(map[string]*sessionState)}
+	return &Plugin{}
 }
 
 func (p *Plugin) Name() string { return PluginName }
@@ -78,6 +77,28 @@ func (p *Plugin) EnabledForModel(model string) bool {
 	return p.appCfg.ExtensionEnabled(PluginName, model)
 }
 
+// getState returns the per-session state for this request.
+// Uses RequestContext.SessionData so concurrent users don't mix.
+func (p *Plugin) getState(ctx *plugin.RequestContext) *sessionState {
+	if ctx.SessionData == nil {
+		ctx.SessionData = make(map[string]any)
+	}
+	raw, ok := ctx.SessionData[sessionStateKey]
+	if !ok {
+		state := &sessionState{}
+		ctx.SessionData[sessionStateKey] = state
+		return state
+	}
+	// The raw value is from session initialization which stores *sync.Mutex
+	// guarded maps. Here we use a pointer directly stored in SessionData.
+	state, ok := raw.(*sessionState)
+	if !ok {
+		state = &sessionState{}
+		ctx.SessionData[sessionStateKey] = state
+	}
+	return state
+}
+
 // MutateRequest implements plugin.RequestMutator.
 // Tracks tool calls and injects warnings when limits are exceeded.
 func (p *Plugin) MutateRequest(ctx *plugin.RequestContext, req *format.CoreRequest) {
@@ -94,41 +115,30 @@ func (p *Plugin) MutateRequest(ctx *plugin.RequestContext, req *format.CoreReque
 		}
 	}
 
-	sessionKey := req.Model // Use model as rough session key
-	p.mu.Lock()
-	state, ok := p.sessions[sessionKey]
-	if !ok {
-		state = &sessionState{}
-		p.sessions[sessionKey] = state
-	}
+	state := p.getState(ctx)
+
 	// Reset if no tool calls this turn
 	if toolCount == 0 {
 		state.consecutiveTools = 0
 		state.warned = false
-	} else {
-		state.consecutiveTools += toolCount
+		return
 	}
-	currentCount := state.consecutiveTools
-	warned := state.warned
-	p.mu.Unlock()
 
-	if currentCount >= p.cfg.HardLimit && warned {
+	state.consecutiveTools += toolCount
+
+	if state.consecutiveTools >= p.cfg.HardLimit && state.warned {
 		req.System = append(req.System, format.CoreContentBlock{
 			Type: "text",
-			Text: "[CRITICAL: You have made " + itoa(currentCount) + " consecutive tool calls. STOP calling tools immediately. Provide your best answer NOW based on the information you already have. Do NOT call any more tools.]",
+			Text: "[CRITICAL: You have made " + itoa(state.consecutiveTools) + " consecutive tool calls. STOP calling tools immediately. Provide your best answer NOW based on the information you already have. Do NOT call any more tools.]",
 		})
-		p.mu.Lock()
 		state.consecutiveTools = 0
 		state.warned = false
-		p.mu.Unlock()
-	} else if currentCount >= p.cfg.MaxConsecutiveTools && !warned {
+	} else if state.consecutiveTools >= p.cfg.MaxConsecutiveTools && !state.warned {
 		req.System = append(req.System, format.CoreContentBlock{
 			Type: "text",
-			Text: "[Note: " + itoa(currentCount) + " tool calls in a row. Consider whether you have enough information to answer. If so, answer now without calling more tools.]",
+			Text: "[Note: " + itoa(state.consecutiveTools) + " tool calls in a row. Consider whether you have enough information to answer. If so, answer now without calling more tools.]",
 		})
-		p.mu.Lock()
 		state.warned = true
-		p.mu.Unlock()
 	}
 }
 
@@ -155,6 +165,6 @@ func itoa(n int) string {
 }
 
 var (
-	_ plugin.Plugin        = (*Plugin)(nil)
+	_ plugin.Plugin         = (*Plugin)(nil)
 	_ plugin.RequestMutator = (*Plugin)(nil)
 )

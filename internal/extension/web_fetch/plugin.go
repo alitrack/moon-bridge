@@ -1,6 +1,7 @@
 // Package webfetch provides a proxy-side web_fetch tool for Codex.
 // When enabled, it injects a web_fetch tool definition into requests
 // and executes URL fetches on the proxy side (bypassing Codex sandbox).
+// Uses Jina Reader (r.jina.ai) for clean Markdown extraction.
 package webfetch
 
 import (
@@ -84,7 +85,7 @@ func (p *Plugin) EnabledForModel(model string) bool {
 func (p *Plugin) InjectTools(ctx *plugin.RequestContext) []format.CoreTool {
 	return []format.CoreTool{{
 		Name:        "web_fetch",
-		Description: "Fetch content from a URL over HTTP/HTTPS. Use this to read web pages, API responses, or documentation. Returns the HTTP status, headers, and body as text.",
+		Description: "Fetch and extract clean Markdown content from a URL using Jina Reader. Use this to read web pages, documentation, or API responses. Returns clean, readable text suitable for LLM consumption.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -92,10 +93,9 @@ func (p *Plugin) InjectTools(ctx *plugin.RequestContext) []format.CoreTool {
 					"type":        "string",
 					"description": "The URL to fetch (must start with http:// or https://)",
 				},
-				"method": map[string]any{
-					"type":        "string",
-					"enum":        []string{"GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"},
-					"description": "HTTP method (default: GET)",
+				"raw": map[string]any{
+					"type":        "boolean",
+					"description": "If true, skip Jina Reader and fetch raw content directly (default: false)",
 				},
 			},
 			"required": []string{"url"},
@@ -120,7 +120,6 @@ func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.C
 			if i > 0 && messages[i-1].Role == "assistant" {
 				for _, ab := range messages[i-1].Content {
 					if ab.Type == "tool_use" && ab.ToolUseID == block.ToolUseID && ab.ToolName == "web_fetch" {
-						// This is a web_fetch call — execute it proxy-side
 						result := p.executeFetch(ab.ToolInput)
 						block.ToolResultContent = []format.CoreContentBlock{{
 							Type: "text",
@@ -136,8 +135,8 @@ func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.C
 
 func (p *Plugin) executeFetch(input json.RawMessage) string {
 	var args struct {
-		URL    string `json:"url"`
-		Method string `json:"method"`
+		URL string `json:"url"`
+		Raw bool   `json:"raw"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return fmt.Sprintf(`{"error": "invalid arguments: %v"}`, err)
@@ -148,12 +147,54 @@ func (p *Plugin) executeFetch(input json.RawMessage) string {
 	if !strings.HasPrefix(args.URL, "http://") && !strings.HasPrefix(args.URL, "https://") {
 		return `{"error": "url must start with http:// or https://"}`
 	}
-	if args.Method == "" {
-		args.Method = "GET"
+
+	// Primary: Jina Reader for clean Markdown extraction
+	if !args.Raw {
+		result, err := p.fetchViaJina(args.URL)
+		if err == nil {
+			return fmt.Sprintf(`{"status": 200, "source": "jina", "content": %s}`, jsonEscape(result))
+		}
 	}
 
+	// Fallback: direct HTTP fetch
+	return fetchDirect(args.URL, p.cfg.TimeoutSeconds, p.cfg.MaxBodyBytes)
+}
+
+// fetchViaJina uses Jina Reader (r.jina.ai) to extract clean Markdown from a URL.
+func (p *Plugin) fetchViaJina(url string) (string, error) {
+	jinaURL := "https://r.jina.ai/" + url
+
 	client := &http.Client{Timeout: time.Duration(p.cfg.TimeoutSeconds) * time.Second}
-	req, err := http.NewRequest(args.Method, args.URL, nil)
+	req, err := http.NewRequest("GET", jinaURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create jina request: %w", err)
+	}
+	req.Header.Set("Accept", "text/markdown")
+	req.Header.Set("User-Agent", "MoonBridge-WebFetch/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("jina fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("jina returned status %d", resp.StatusCode)
+	}
+
+	limited := io.LimitReader(resp.Body, int64(p.cfg.MaxBodyBytes))
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return "", fmt.Errorf("jina read: %w", err)
+	}
+
+	return string(body), nil
+}
+
+// fetchDirect does a raw HTTP GET.
+func fetchDirect(url string, timeoutSec, maxBytes int) string {
+	client := &http.Client{Timeout: time.Duration(timeoutSec) * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return fmt.Sprintf(`{"error": "failed to create request: %v"}`, err)
 	}
@@ -165,7 +206,7 @@ func (p *Plugin) executeFetch(input json.RawMessage) string {
 	}
 	defer resp.Body.Close()
 
-	limited := io.LimitReader(resp.Body, int64(p.cfg.MaxBodyBytes))
+	limited := io.LimitReader(resp.Body, int64(maxBytes))
 	body, err := io.ReadAll(limited)
 	if err != nil {
 		return fmt.Sprintf(`{"error": "read failed: %v", "status": %d}`, err, resp.StatusCode)
@@ -185,7 +226,7 @@ func jsonEscape(s string) string {
 
 // Compile-time interface checks.
 var (
-	_ plugin.Plugin         = (*Plugin)(nil)
-	_ plugin.ToolInjector   = (*Plugin)(nil)
+	_ plugin.Plugin          = (*Plugin)(nil)
+	_ plugin.ToolInjector    = (*Plugin)(nil)
 	_ plugin.MessageRewriter = (*Plugin)(nil)
 )

@@ -12,6 +12,7 @@ import (
 
 	"moonbridge/internal/config"
 	"moonbridge/internal/extension/plugin"
+	responsestore "moonbridge/internal/extension/response_store"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/protocol/openai"
 	"moonbridge/internal/service/provider"
@@ -373,6 +374,12 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 		// Inject web_search tool if enabled for this model.
 		if pm.ResolvedWebSearchForModel(responsesRequest.Model) == "enabled" {
 			upstreamRequest.Tools = InjectWebSearchTool(upstreamRequest.Tools)
+		}
+
+		// Bridge previous_response_id if supported.
+		if bridged, ok := responsestore.BridgePreviousResponse(&upstreamRequest); ok {
+			bridgedJSON, _ := json.Marshal(bridged)
+			upstreamRequest.Input = bridgedJSON
 		}
 
 		body, err := json.Marshal(upstreamRequest)
