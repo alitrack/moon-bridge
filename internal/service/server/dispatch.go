@@ -521,6 +521,19 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 					logBillingUsageLine(responsesRequest.Model, actualModel, billingUsage, server.stats)
 				}
 			}
+
+			// Call response post-processors (e.g., response_store, tool_call fixup).
+			if !responsesRequest.Stream && server.pluginRegistry != nil {
+				var resp openai.Response
+				if err := json.Unmarshal(captured.Bytes(), &resp); err == nil && resp.ID != "" {
+					sess := server.sessionForRequest(request)
+					reqCtx := &plugin.RequestContext{ModelAlias: responsesRequest.Model}
+					if sess != nil {
+						reqCtx.SessionData = sess.ExtensionData
+					}
+					server.pluginRegistry.PostProcessResponse(reqCtx, &resp)
+				}
+			}
 		}
 		if metricTelemetry.Protocol == "" {
 			metricTelemetry = zeroUsage(config.ProtocolOpenAIResponse, "none")
