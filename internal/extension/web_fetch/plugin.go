@@ -103,6 +103,63 @@ func (p *Plugin) InjectTools(ctx *plugin.RequestContext) []format.CoreTool {
 	}}
 }
 
+// MutateRequest implements plugin.RequestMutator.
+// Scans recent user messages for URLs and injects a hint when found,
+// prompting the model to use the web_fetch tool instead of shell HTTP tools.
+func (p *Plugin) MutateRequest(ctx *plugin.RequestContext, req *format.CoreRequest) {
+	if !hasURLsInMessages(req.Messages) {
+		return
+	}
+	// Check if hint already injected (avoid duplication).
+	for _, sys := range req.System {
+		if sys.Type == "text" && containsString(sys.Text, "web_fetch tool available") {
+			return
+		}
+	}
+	req.System = append(req.System, format.CoreContentBlock{
+		Type: "text",
+		Text: "[System: You have a `web_fetch` tool available for making HTTP requests. Use it instead of curl, wget, or other shell-based HTTP tools. Call web_fetch with {\"url\": \"...\"} to fetch any URL. It returns clean Markdown via Jina Reader.]",
+	})
+}
+
+// hasURLsInMessages checks whether any recent user messages contain URLs.
+func hasURLsInMessages(messages []format.CoreMessage) bool {
+	// Check last 5 messages for URLs.
+	start := len(messages) - 5
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(messages); i++ {
+		if messages[i].Role != "user" {
+			continue
+		}
+		for _, block := range messages[i].Content {
+			if block.Type == "text" && containsURL(block.Text) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsURL(s string) bool {
+	return len(s) > 10 &&
+		(containsString(s, "http://") || containsString(s, "https://"))
+}
+
+func containsString(s, substr string) bool {
+	return len(s) >= len(substr) && indexOfSubstring(s, substr) >= 0
+}
+
+func indexOfSubstring(s, substr string) int {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
+}
+
 // RewriteMessages implements plugin.MessageRewriter.
 // Scans incoming tool results for web_fetch calls and executes them proxy-side.
 func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.CoreMessage) []format.CoreMessage {
@@ -228,5 +285,6 @@ func jsonEscape(s string) string {
 var (
 	_ plugin.Plugin          = (*Plugin)(nil)
 	_ plugin.ToolInjector    = (*Plugin)(nil)
+	_ plugin.RequestMutator  = (*Plugin)(nil)
 	_ plugin.MessageRewriter = (*Plugin)(nil)
 )

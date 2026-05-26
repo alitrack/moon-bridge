@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	circuitbreaker "moonbridge/internal/extension/circuit_breaker"
+	contextmanager "moonbridge/internal/extension/context_manager"
 	dbd1 "moonbridge/internal/extension/db/d1"
 	dbsqlite "moonbridge/internal/extension/db/sqlite"
 	deepseekv4 "moonbridge/internal/extension/deepseek_v4"
@@ -43,6 +44,7 @@ func (cat BuiltinExtensionCatalog) ConfigSpecs() []config.ExtensionConfigSpec {
 	specs = append(specs, codextoolproxy.ConfigSpecs()...)
 	specs = append(specs, webfetch.ConfigSpecs()...)
 	specs = append(specs, circuitbreaker.ConfigSpecs()...)
+	specs = append(specs, contextmanager.ConfigSpecs()...)
 	specs = append(specs, responsestore.ConfigSpecs()...)
 	return specs
 }
@@ -69,6 +71,7 @@ func (cat BuiltinExtensionCatalog) NewRegistry(logger *slog.Logger, cfg config.C
 	registry.Register(codextoolproxy.NewPlugin())
 	registry.Register(webfetch.NewPlugin())
 	registry.Register(circuitbreaker.NewPlugin())
+	registry.Register(contextmanager.NewPlugin())
 	registry.Register(responsestore.NewPlugin())
 	return registry
 }
