@@ -930,6 +930,8 @@ type inputItem struct {
 	Type      string          `json:"type"`
 	Role      string          `json:"role"`
 	Content   json.RawMessage `json:"content"`
+	Text      string          `json:"text"`
+	ImageURL  json.RawMessage `json:"image_url"`
 	Summary   json.RawMessage `json:"summary"`
 	CallID    string          `json:"call_id"`
 	Name      string          `json:"name"`
@@ -1138,7 +1140,33 @@ func convertInput(raw json.RawMessage, model string) ([]format.CoreMessage, []fo
 			}
 
 		default:
+			// Try nested content first (role-based items with content array).
 			blocks := contentBlocksFromRaw(item.Content)
+			// Handle flat-format items: input_text with top-level "text", or
+			// input_image with top-level "image_url".
+			if len(blocks) == 0 {
+				if item.Text != "" {
+					blocks = []format.CoreContentBlock{{Type: "text", Text: item.Text}}
+				} else if src := imageSourceFromRaw(item.ImageURL); src != "" {
+					mediaType := "image/png"
+					if strings.HasPrefix(src, "data:") {
+						if header, _, ok := strings.Cut(src, ","); ok {
+							mt := strings.TrimPrefix(header, "data:")
+							if semicolon := strings.IndexByte(mt, ';'); semicolon >= 0 {
+								mt = mt[:semicolon]
+							}
+							if mt != "" {
+								mediaType = mt
+							}
+						}
+					}
+					blocks = []format.CoreContentBlock{{
+						Type:      "image",
+						ImageData: src,
+						MediaType: mediaType,
+					}}
+				}
+			}
 			if len(blocks) > 0 {
 				messages = append(messages, format.CoreMessage{
 					Role:    "user",
