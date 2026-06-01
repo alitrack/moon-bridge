@@ -1555,6 +1555,15 @@ func convertToolWithNamespace(tool Tool, namespace string, disablePatchProxy fun
 	name := namespacedToolName(namespace, tool.Name)
 	ext := make(map[string]any)
 
+	// Defensive: skip tools with empty names to prevent upstream validation
+	// errors (e.g. DeepSeek "Invalid 'tools[N].function.name': empty string").
+	// Namespace-type tools are exempt because their name is used only as prefix
+	// for sub-tools; a namespace with an empty name is unusual but still valid
+	// as long as its sub-tools have proper names.
+	if name == "" && tool.Type != "namespace" {
+		return nil
+	}
+
 	switch tool.Type {
 	case "function":
 		ct := format.CoreTool{

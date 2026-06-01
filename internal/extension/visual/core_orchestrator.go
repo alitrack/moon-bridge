@@ -58,6 +58,10 @@ func (o *CoreOrchestrator) CreateCore(ctx context.Context, req *format.CoreReque
 	}
 	req = cloneCoreRequest(req)
 	req, availableImages := prepareCoreRequestForVisual(req)
+	// Defensive: filter out tools with empty names before sending to upstream.
+	// An empty tool name can originate from Codex MCP tools with unnamed sub-tools
+	// and will cause DeepSeek to reject with "Invalid 'tools[N].function.name': empty string".
+	req.Tools = filterEmptyNameTools(req.Tools)
 	log := slog.Default()
 	aggregatedUsage := format.CoreUsage{}
 	hasAggregatedUsage := false
@@ -307,4 +311,21 @@ func cloneCoreRequest(req *format.CoreRequest) *format.CoreRequest {
 		return &cloned
 	}
 	return &cloned
+}
+
+// filterEmptyNameTools removes tools with empty names from the tool list.
+// This prevents upstream validation errors (e.g., DeepSeek rejecting
+// "Invalid 'tools[N].function.name': empty string").
+func filterEmptyNameTools(tools []format.CoreTool) []format.CoreTool {
+	if len(tools) == 0 {
+		return tools
+	}
+	filtered := make([]format.CoreTool, 0, len(tools))
+	for _, t := range tools {
+		if t.Name == "" {
+			continue
+		}
+		filtered = append(filtered, t)
+	}
+	return filtered
 }
