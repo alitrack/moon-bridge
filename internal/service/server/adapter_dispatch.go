@@ -863,7 +863,7 @@ func (s *Server) handleAdapterStream(
 		s.writeTrace(streamRecord)
 	}()
 
-	if candidate.Protocol == config.ProtocolAnthropic && coreRequestHasImage(coreReq) {
+	if candidate.Protocol == config.ProtocolAnthropic && coreRequestHasNewImage(coreReq) {
 		if providerAdapter := s.adapterRegistryProvider(config.ProtocolAnthropic); providerAdapter != nil {
 			finalizeAnthropicUpstream := func(_ context.Context, upstream any) (any, error) {
 				msgReq, err := normalizeAnthropicRequest(upstream)
@@ -1803,6 +1803,28 @@ func coreBlockHasImage(block format.CoreContentBlock) bool {
 		if coreBlockHasImage(child) {
 			return true
 		}
+	}
+	return false
+}
+
+// coreRequestHasNewImage checks whether the LATEST user message in the
+// request contains image blocks. Unlike coreRequestHasImage, this ignores
+// images in conversation history — preventing the visual fast path from
+// activating on follow-up text messages that only carry old image references.
+func coreRequestHasNewImage(req *format.CoreRequest) bool {
+	if req == nil {
+		return false
+	}
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role != "user" {
+			continue
+		}
+		for _, block := range req.Messages[i].Content {
+			if coreBlockHasImage(block) {
+				return true
+			}
+		}
+		return false
 	}
 	return false
 }
