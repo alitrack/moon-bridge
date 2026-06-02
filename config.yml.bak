@@ -1,0 +1,144 @@
+mode: "Transform"
+
+log:
+  level: "info"
+  format: "text"
+
+server:
+  addr: "127.0.0.1:38440"
+
+cache:
+  mode: "automatic"
+  prompt_caching: true
+
+defaults:
+  model: "deepseek-v4-flash"
+  max_tokens: 65536
+
+extensions:
+  visual:
+    enabled: true
+    config:
+      provider: qwen-vision
+      model: Qwen/Qwen3-VL-8B-Instruct
+      max_rounds: 4
+      max_tokens: 1024
+
+models:
+  Qwen/Qwen3-VL-8B-Instruct:
+    context_window: 32768
+    max_output_tokens: 4096
+    display_name: "Qwen3 VL 8B (魔搭)"
+    input_modalities: ["text", "image"]
+
+  deepseek-v4-pro:
+    input_modalities: ["text", "image"]
+    context_window: 128000
+    max_output_tokens: 65536
+    display_name: "DeepSeek V4 Pro"
+    default_reasoning_level: "xhigh"
+    supported_reasoning_levels:
+      - effort: "high"
+      - effort: "xhigh"
+    supports_reasoning_summaries: true
+    default_reasoning_summary: "auto"
+    extensions:
+      deepseek_v4:
+        enabled: true
+      web_fetch:
+        enabled: true
+      circuit_breaker:
+        enabled: true
+      response_store:
+        enabled: true
+      visual:
+        enabled: true
+        config:
+          provider: qwen-vision
+          model: Qwen/Qwen3-VL-8B-Instruct
+          max_rounds: 4
+          max_tokens: 1024
+
+  deepseek-v4-flash:
+    input_modalities: ["text", "image"]
+    context_window: 128000
+    max_output_tokens: 65536
+    display_name: "DeepSeek V4 Flash"
+    default_reasoning_level: "high"
+    supported_reasoning_levels:
+      - effort: "high"
+      - effort: "xhigh"
+    supports_reasoning_summaries: true
+    default_reasoning_summary: "auto"
+    extensions:
+      deepseek_v4:
+        enabled: true
+      web_fetch:
+        enabled: true
+      circuit_breaker:
+        enabled: true
+      response_store:
+        enabled: true
+      visual:
+        enabled: true
+        config:
+          provider: qwen-vision
+          model: Qwen/Qwen3-VL-8B-Instruct
+          max_rounds: 4
+          max_tokens: 1024
+
+providers:
+  qwen-vision:
+    base_url: "https://api-inference.modelscope.cn/v1"
+    api_key: "ms-8ecc2026-4dfb-4f22-8e7a-e60d45c676c0"
+    protocol: "openai-chat"
+    offers:
+      - model: Qwen/Qwen3-VL-8B-Instruct
+        overrides:
+          input_modalities: ["text", "image"]
+
+  deepseek:
+    base_url: "https://api.deepseek.com/anthropic"
+    api_key: "sk-8fc28136e409420c964e6134204f99d4"
+    version: "2023-06-01"
+    offers:
+      - model: deepseek-v4-pro
+      - model: deepseek-v4-flash
+
+routes:
+  "gpt-5.5":
+    model: deepseek-v4-pro
+    provider: deepseek
+    extensions:
+      visual:
+        enabled: true
+  "gpt-5.4":
+    model: deepseek-v4-pro
+    provider: deepseek
+    extensions:
+      visual:
+        enabled: true
+  "gpt-5.3-codex":
+    model: deepseek-v4-pro
+    provider: deepseek
+    extensions:
+      visual:
+        enabled: true
+  "gpt-5.2":
+    model: deepseek-v4-flash
+    provider: deepseek
+    extensions:
+      visual:
+        enabled: true
+  "gpt-5.1-codex":
+    model: deepseek-v4-flash
+    provider: deepseek
+    extensions:
+      visual:
+        enabled: true
+  "gpt-5.1-codex-max":
+    model: deepseek-v4-pro
+    provider: deepseek
+    extensions:
+      visual:
+        enabled: true

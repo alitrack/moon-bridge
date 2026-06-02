@@ -188,9 +188,20 @@ func TestResolveModel_ModelNotFound(t *testing.T) {
 		t.Fatalf("NewProviderManager() error = %v", err)
 	}
 
-	_, err = manager.ResolveModel("nonexistent-model")
-	if err == nil {
-		t.Fatal("ResolveModel() expected error for unknown model")
+	// Unknown model should fall through to default provider with model name passed as-is.
+	route, err := manager.ResolveModel("nonexistent-model")
+	if err != nil {
+		t.Fatalf("ResolveModel() unexpected error for unknown model: %v", err)
+	}
+	candidate, ok := route.Preferred()
+	if !ok {
+		t.Fatal("Preferred() returned false, expected true")
+	}
+	if candidate.UpstreamModel != "nonexistent-model" {
+		t.Errorf("expected upstream model 'nonexistent-model', got %q", candidate.UpstreamModel)
+	}
+	if candidate.ProviderKey != "default" {
+		t.Errorf("expected provider 'default', got %q", candidate.ProviderKey)
 	}
 }
 
@@ -410,9 +421,17 @@ func TestReloadAfterInitialCreation(t *testing.T) {
 	if upstream := manager.UpstreamModelFor("test-model"); upstream != "test-model" {
 		t.Fatalf("UpstreamModelFor(test-model) after reload = %q, want %q (fallback)", upstream, "test-model")
 	}
-	// ResolveModel should fail for the old route alias (no longer in routes map).
-	if _, err := manager.ResolveModel("test-model"); err == nil {
-		t.Fatal("ResolveModel(test-model) should fail after reload (route removed)")
+	// ResolveModel should fall through to default provider with model name as-is.
+	route, err := manager.ResolveModel("test-model")
+	if err != nil {
+		t.Fatalf("ResolveModel(test-model) after reload error = %v", err)
+	}
+	candidate, ok := route.Preferred()
+	if !ok {
+		t.Fatal("Preferred() returned false, expected true after reload fallback")
+	}
+	if candidate.UpstreamModel != "test-model" {
+		t.Errorf("expected upstream model 'test-model', got %q", candidate.UpstreamModel)
 	}
 
 	// New model should work.

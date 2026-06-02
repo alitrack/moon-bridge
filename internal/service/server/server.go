@@ -205,18 +205,25 @@ func (s *Server) listModels() []map[string]any {
 	// Get provider data from runtime (full config snapshot).
 	var providerDefs map[string]config.ProviderDef
 	var routes map[string]config.RouteEntry
+	var modelDefs map[string]config.ModelDef
 	if s.runtime != nil {
 		fullCfg := s.runtime.Current().Config
 		providerDefs = fullCfg.ProviderDefs
 		routes = fullCfg.Routes
+		modelDefs = fullCfg.Models
 	}
 
 	for key, def := range providerDefs {
 		for modelName := range def.Models {
+			modalities := []string{"text"}
+			if md, ok := modelDefs[modelName]; ok && len(md.InputModalities) > 0 {
+				modalities = md.InputModalities
+			}
 			models = append(models, map[string]any{
-				"slug":     key + "/" + modelName,
-				"name":     modelName,
-				"provider": key,
+				"slug":              key + "/" + modelName,
+				"name":              modelName,
+				"provider":          key,
+				"input_modalities":  modalities,
 			})
 		}
 	}
@@ -224,17 +231,31 @@ func (s *Server) listModels() []map[string]any {
 	for alias, route := range routes {
 		displayName := route.DisplayName
 		if displayName == "" {
-			// When no explicit display_name is configured for this route,
-			// derive from the alias slug (e.g. "gpt-5.4" -> "GPT 5.4").
-			// This avoids inheriting the underlying model's DisplayName,
-			// which would cause duplicates when multiple routes point to the same model.
 			displayName = slugDisplayName(alias)
 		}
+		modalities := route.InputModalities
+		if len(modalities) == 0 {
+			// Fall back to model def's modalities.
+			resolvedModel := route.Model
+			if resolvedModel == "" {
+				resolvedModel = alias
+			}
+			// Strip context-window suffixes like "[1m]" for lookup.
+			if idx := strings.Index(resolvedModel, "["); idx >= 0 {
+				resolvedModel = resolvedModel[:idx]
+			}
+			if md, ok := modelDefs[resolvedModel]; ok && len(md.InputModalities) > 0 {
+				modalities = md.InputModalities
+			} else {
+				modalities = []string{"text"}
+			}
+		}
 		models = append(models, map[string]any{
-			"slug":     alias,
-			"name":     displayName,
-			"provider": route.Provider,
-			"model":    route.Model,
+			"slug":              alias,
+			"name":              displayName,
+			"provider":          route.Provider,
+			"model":             route.Model,
+			"input_modalities":  modalities,
 		})
 	}
 	return models

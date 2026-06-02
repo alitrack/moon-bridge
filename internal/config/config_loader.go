@@ -669,13 +669,18 @@ func buildRoutes(rawRoutes map[string]RouteFileConfig, providerDefs map[string]P
 		modelSlug := strings.TrimSpace(routeCfg.Model)
 		providerKey := strings.TrimSpace(routeCfg.Provider)
 
-		// Backward compat: if To is set and model is empty, parse it.
-		if modelSlug == "" && routeCfg.To != "" {
-			providerKey, modelSlug = parseRouteSpec(routeCfg.To)
-		}
-		if modelSlug == "" {
-			return nil, fmt.Errorf("routes.%s: model is required", trimmedAlias)
-		}
+	// Backward compat: if To is set and model is empty, parse it.
+	if modelSlug == "" && routeCfg.To != "" {
+		providerKey, modelSlug = parseRouteSpec(routeCfg.To)
+	}
+	// Pass-through: if model is empty but provider is specified,
+	// use the route alias itself as the upstream model name.
+	if modelSlug == "" && providerKey != "" {
+		modelSlug = trimmedAlias
+	}
+	if modelSlug == "" {
+		return nil, fmt.Errorf("routes.%s: model is required", trimmedAlias)
+	}
 
 		// If no provider specified, find the first provider that offers this model.
 		if providerKey == "" {
