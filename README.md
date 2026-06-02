@@ -1,6 +1,6 @@
 # Moon Bridge
 
-Moon Bridge 是一个用 Go 编写的协议转换与模型路由代理。对外暴露 **OpenAI Responses API**（`/v1/responses`），对内支持 **Anthropic Messages**、**Google Gemini（GenAI）**、**OpenAI Chat Completions** 等多种上游协议。客户端指定不同模型别名时，自动将请求路由到对应上游 Provider 并在协议间自动转换。
+Moon Bridge 是一个用 Go 编写的协议转换与模型路由代理。**三个入口端点原生支持**：`/v1/messages`（Claude Code）、`/v1/responses`（Codex CLI）、`/v1/chat/completions`（OpenAI Chat 客户端）。所有请求统一转换为内部 CoreRequest，按配置路由到 **Anthropic Messages**、**Google Gemini（GenAI）**、**OpenAI Chat Completions** 等上游协议。客户端指定不同模型别名时，自动将请求路由到对应上游 Provider 并在协议间自动转换。
 
 > 🍳 **新手先看这里** → [CookBook.md](CookBook.md)：一份按目标找做法的菜谱，5 分钟跑通第一个对话。
 > 官方qq群：1103798316
@@ -24,7 +24,7 @@ go run ./cmd/moonbridge -config config.yml
 
 ## 核心能力
 
-- **协议转换**：OpenAI Responses → Anthropic Messages / Google Gemini / OpenAI Chat，适配四种上游协议
+- **协议转换**：三入口（Messages / Responses / Chat Completions）→ Anthropic Messages / Google Gemini / OpenAI Chat，统一管道转换
 - **模型路由**：通过 `routes` 配置将模型别名映射到不同 Provider 的上游模型名
 - **插件扩展**：`CorePluginHooks` 接口，支持请求预处理、响应后处理、流拦截
 - **请求跟踪**：完整链路记录，每步转换均可追溯
@@ -71,7 +71,7 @@ extensions:
 
 | 模式 | 行为 |
 |------|------|
-| `Transform`（默认） | 接收 OpenAI Responses 请求 → 协议转换 → 转发 → 反向转换后返回 |
+| `Transform`（默认） | 接收 Messages / Responses / Chat Completions 三种入口请求 → 协议转换 → 转发到上游 → 反向转换后返回 |
 | `CaptureAnthropic` | 接收 Anthropic Messages 请求 → 透明转发到 Anthropic 上游 |
 | `CaptureResponse` | 接收 OpenAI Responses 请求 → 透明转发到 OpenAI 上游 |
 
@@ -81,20 +81,24 @@ extensions:
 
 ## 与 Codex CLI 配合使用
 
-将 Moon Bridge 地址设为 Codex 的 OpenAI API Base URL 即可：
+将 Moon Bridge 地址设为 Codex 的 custom provider：
 
 ```toml
-[openai]
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = false
 base_url = "http://127.0.0.1:38440/v1"
-api_key = "any-non-empty-value"
 ```
 
-然后在 Moon Bridge 配置中定义与 Codex 模型同名的路由。
+然后在 Moon Bridge 配置的 `routes` 中定义模型别名映射。
 
 ## 与 Claude Code 配合使用
 
 ```bash
-claude --model your-alias --api-url http://127.0.0.1:38440 --api-key any-value
+export ANTHROPIC_BASE_URL=http://127.0.0.1:38440/v1
+export ANTHROPIC_AUTH_TOKEN=any-value
+export ANTHROPIC_MODEL=your-alias
 ```
 
 ## Docker 部署
@@ -122,8 +126,11 @@ docker run -p 38440:38440 -v $(pwd)/config.yml:/config/config.yml moonbridge
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/v1/responses` | POST | OpenAI Responses API 主入口 |
+| `/v1/messages` | POST | Anthropic Messages API 入口（Claude Code 直连） |
+| `/messages` | POST | 同上（无 `/v1` 前缀） |
+| `/v1/responses` | POST | OpenAI Responses API 入口（Codex CLI 直连） |
 | `/responses` | POST | 同上（无 `/v1` 前缀） |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions API 入口 |
 | `/v1/models` | GET | 列出可用模型 |
 | `/models` | GET | 同上 |
 | `/api/v1/` | — | 管理 API（需启用持久化） |
