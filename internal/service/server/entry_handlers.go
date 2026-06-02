@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -581,6 +582,8 @@ func toolResultToBlocks(content any) []anthropic.ContentBlock {
 	switch v := content.(type) {
 	case string:
 		return []anthropic.ContentBlock{{Type: "text", Text: v}}
+	case []anthropic.ContentBlock:
+		return v
 	case []any:
 		var blocks []anthropic.ContentBlock
 		for _, item := range v {
@@ -848,16 +851,27 @@ func (s *Server) injectVisualDescriptions(ctx context.Context, req anthropic.Mes
 			hasImages = true
 			break
 		}
+		// Claude Code sends images inside tool_result blocks (Read tool output).
+		if block.Type == "tool_result" {
+			for _, inner := range toolResultContentBlocks(block.Content) {
+				if inner.Type == "image" && inner.Source != nil {
+					hasImages = true
+					break
+				}
+			}
+		}
 	}
 	if !hasImages {
 		return req
 	}
 
 	if s.runtime == nil {
+		slog.Default().Warn("visual: runtime is nil, skipping")
 		return req
 	}
 	cfgV := s.runtime.Current().Config
 	visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, req.Model)
+	slog.Default().Info("visual: config check", "model", req.Model, "visOk", visOk, "provider", visCfg.Provider, "visModel", visCfg.Model)
 	if !visOk || visCfg.Provider == "" || visCfg.Model == "" {
 		return req
 	}
@@ -875,6 +889,35 @@ func (s *Server) injectVisualDescriptions(ctx context.Context, req anthropic.Mes
 	msg := &req.Messages[lastUserIdx]
 	var newContent []anthropic.ContentBlock
 	for _, block := range msg.Content {
+		if block.Type == "tool_result" {
+			// Claude Code sends images inside tool_result blocks (Read tool output).
+			// Recurse into tool_result content to find and replace image blocks.
+			innerBlocks := toolResultContentBlocks(block.Content)
+			if len(innerBlocks) > 0 {
+				newBlock := block
+				var newInner []anthropic.ContentBlock
+				for _, inner := range innerBlocks {
+					if inner.Type != "image" || inner.Source == nil {
+						newInner = append(newInner, inner)
+						continue
+					}
+					desc, err := s.describeImage(ctx, chatClient, visCfg, inner.Source)
+					if err != nil {
+						slog.Default().Warn("visual description failed", "error", err)
+						newInner = append(newInner, inner)
+						continue
+					}
+					newInner = append(newInner, anthropic.ContentBlock{
+						Type: "text",
+						Text: "[Image description from vision model (" + inner.Source.MediaType + ")]\n" + desc,
+					})
+					modified = true
+				}
+				newBlock.Content = newInner
+				newContent = append(newContent, newBlock)
+				continue
+			}
+		}
 		if block.Type != "image" || block.Source == nil {
 			newContent = append(newContent, block)
 			continue
@@ -902,6 +945,20 @@ func (s *Server) injectVisualDescriptions(ctx context.Context, req anthropic.Mes
 func (s *Server) describeImage(ctx context.Context, chatClient *chat.Client,
 	visCfg visualpkg.Config, source *anthropic.ImageSource,
 ) (string, error) {
+	// Hash raw base64 data for cross-request caching. Same image sent
+	// across multiple Claude Code tool-call rounds gets the same key,
+	// avoiding redundant Qwen VL calls (saves ~8s per duplicate).
+	cacheKey := ""
+	if source.Data != "" {
+		h := sha256.Sum256([]byte(source.Data))
+		cacheKey = fmt.Sprintf("%x", h[:16])
+	}
+	if cacheKey != "" {
+		if cached, ok := s.visualCache.Load(cacheKey); ok {
+			return cached.(string), nil
+		}
+	}
+
 	var imgURL string
 	switch source.Type {
 	case "base64":
@@ -946,6 +1003,10 @@ func (s *Server) describeImage(ctx context.Context, chatClient *chat.Client,
 	if content == "" {
 		return "", fmt.Errorf("empty response from vision model")
 	}
+
+	if cacheKey != "" {
+		s.visualCache.Store(cacheKey, content)
+	}
 	return content, nil
 }
 
@@ -976,4 +1037,23 @@ func compressAndEncodeImage(b64Data string, mediaType string) string {
 		return "data:" + mediaType + ";base64," + b64Data
 	}
 	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+// toolResultContentBlocks extracts []ContentBlock from a tool_result's
+// Content field, which is typed as `any`. Uses JSON round-trip to ensure
+// correct deserialization of nested source fields.
+func toolResultContentBlocks(content any) []anthropic.ContentBlock {
+	if content == nil {
+		return nil
+	}
+	// Re-marshal and unmarshal to get proper Go types.
+	b, err := json.Marshal(content)
+	if err != nil {
+		return nil
+	}
+	var blocks []anthropic.ContentBlock
+	if err := json.Unmarshal(b, &blocks); err != nil {
+		return nil
+	}
+	return blocks
 }

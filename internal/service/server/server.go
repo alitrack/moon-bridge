@@ -73,6 +73,10 @@ type Server struct {
 	sessionManager  session.Manager
 	usageTracker    usage.Tracker
 	traceWriter     trace.Writer
+	// visualCache caches Qwen VL descriptions keyed by SHA256 of base64 image data.
+	// Avoids redundant vision calls when the same image appears across multiple
+	// tool-call rounds in a Claude Code conversation.
+	visualCache sync.Map
 }
 
 func (s *Server) runtimeSnapshot() *runtime.ConfigSnapshot {
