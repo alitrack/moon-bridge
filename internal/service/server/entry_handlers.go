@@ -1,11 +1,16 @@
 package server
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
+	_ "image/png"
 	"io"
 	"log/slog"
-	"context"
 	"net/http"
 	"os"
 	"strings"
@@ -900,12 +905,12 @@ func (s *Server) describeImage(ctx context.Context, chatClient *chat.Client,
 	var imgURL string
 	switch source.Type {
 	case "base64":
-		imgURL = "data:" + source.MediaType + ";base64," + source.Data
+		imgURL = compressAndEncodeImage(source.Data, source.MediaType)
 	case "url":
 		imgURL = source.URL
 	default:
 		if source.Data != "" {
-			imgURL = "data:" + source.MediaType + ";base64," + source.Data
+			imgURL = compressAndEncodeImage(source.Data, source.MediaType)
 		} else if source.URL != "" {
 			imgURL = source.URL
 		} else {
@@ -942,4 +947,33 @@ func (s *Server) describeImage(ctx context.Context, chatClient *chat.Client,
 		return "", fmt.Errorf("empty response from vision model")
 	}
 	return content, nil
+}
+
+// compressAndEncodeImage compresses large PNG images to JPEG before sending
+// to the vision model, reducing payload size dramatically without meaningful
+// quality loss for image description purposes.
+//
+// Images under 100KB raw bytes or non-PNG images are passed through unchanged.
+func compressAndEncodeImage(b64Data string, mediaType string) string {
+	// Only compress PNG — JPEG/GIF/WebP are already compact or unsupported by stdlib.
+	if mediaType != "image/png" {
+		return "data:" + mediaType + ";base64," + b64Data
+	}
+	raw, err := base64.StdEncoding.DecodeString(b64Data)
+	if err != nil || len(raw) < 100*1024 {
+		return "data:" + mediaType + ";base64," + b64Data
+	}
+	img, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return "data:" + mediaType + ";base64," + b64Data
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80}); err != nil {
+		return "data:" + mediaType + ";base64," + b64Data
+	}
+	if buf.Len() >= len(raw) {
+		// JPEG wasn't smaller — keep original
+		return "data:" + mediaType + ";base64," + b64Data
+	}
+	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(buf.Bytes())
 }
