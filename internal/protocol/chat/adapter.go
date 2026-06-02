@@ -94,6 +94,19 @@ func (a *ChatProviderAdapter) FromCoreRequest(ctx context.Context, req *format.C
 
 	// Messages.
 	for _, msg := range req.Messages {
+		// Convert user+tool_result messages (CoreOrchestrator format) to
+		// tool-role messages required by the Chat protocol.
+		// CoreOrchestrator produces: {role:"user", content:[tool_result{id:x}, tool_result{id:y}]}
+		// Chat protocol requires:     {role:"tool", tool_call_id:x}, {role:"tool", tool_call_id:y}
+		if msg.Role == "user" && hasToolResults(msg.Content) {
+			for _, b := range msg.Content {
+				if b.Type != "tool_result" {
+					continue
+				}
+				chatReq.Messages = append(chatReq.Messages, a.toolResultToToolMessage(b))
+			}
+			continue
+		}
 		chatMsg := a.toChatMessage(msg)
 		chatReq.Messages = append(chatReq.Messages, chatMsg)
 	}
@@ -617,6 +630,30 @@ func (a *ChatProviderAdapter) toChatMessage(msg format.CoreMessage) ChatMessage 
 	}
 
 	return chatMsg
+}
+
+// hasToolResults checks if any content block is a tool_result.
+func hasToolResults(blocks []format.CoreContentBlock) bool {
+	for _, b := range blocks {
+		if b.Type == "tool_result" {
+			return true
+		}
+	}
+	return false
+}
+
+// toolResultToToolMessage converts a CoreFormat tool_result block into
+// a ChatMessage with role "tool" and proper ToolCallID.
+func (a *ChatProviderAdapter) toolResultToToolMessage(b format.CoreContentBlock) ChatMessage {
+	var toolResultText string
+	for _, tc := range b.ToolResultContent {
+		toolResultText += tc.Text
+	}
+	return ChatMessage{
+		Role:       "tool",
+		Content:    toolResultText,
+		ToolCallID: b.ToolUseID,
+	}
 }
 
 // toChatContent converts []CoreContentBlock to a Chat content value.

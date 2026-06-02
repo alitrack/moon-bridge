@@ -26,9 +26,80 @@ type MessageRequest struct {
 	OutputConfig  *OutputConfig   `json:"output_config,omitempty"`
 }
 
+// UnmarshalJSON handles string-or-array system and delegates to Message.UnmarshalJSON.
+func (r *MessageRequest) UnmarshalJSON(data []byte) error {
+	type requestAlias struct {
+		Model        string          `json:"model"`
+		MaxTokens    int             `json:"max_tokens"`
+		System       json.RawMessage `json:"system,omitempty"`
+		Messages     []Message       `json:"messages"`
+		Tools        []Tool          `json:"tools,omitempty"`
+		ToolChoice   *ToolChoice     `json:"tool_choice,omitempty"`
+		Temperature  *float64        `json:"temperature,omitempty"`
+		TopP         *float64        `json:"top_p,omitempty"`
+		TopK         *int            `json:"top_k,omitempty"`
+		StopSequences []string       `json:"stop_sequences,omitempty"`
+		Metadata     map[string]any  `json:"metadata,omitempty"`
+		Stream       bool            `json:"stream,omitempty"`
+		Thinking     *ThinkingConfig `json:"thinking,omitempty"`
+		OutputConfig *OutputConfig   `json:"output_config,omitempty"`
+	}
+	var raw requestAlias
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	r.Model = raw.Model
+	r.MaxTokens = raw.MaxTokens
+	r.Messages = raw.Messages
+	r.Tools = raw.Tools
+	r.ToolChoice = raw.ToolChoice
+	r.Temperature = raw.Temperature
+	r.TopP = raw.TopP
+	r.TopK = raw.TopK
+	r.StopSequences = raw.StopSequences
+	r.Metadata = raw.Metadata
+	r.Stream = raw.Stream
+	r.Thinking = raw.Thinking
+	r.OutputConfig = raw.OutputConfig
+
+	if len(raw.System) == 0 {
+		return nil
+	}
+	// Try string first.
+	var sysStr string
+	if err := json.Unmarshal(raw.System, &sysStr); err == nil {
+		r.System = []ContentBlock{{Type: "text", Text: sysStr}}
+		return nil
+	}
+	return json.Unmarshal(raw.System, &r.System)
+}
+
 type Message struct {
 	Role    string         `json:"role"`
 	Content []ContentBlock `json:"content"`
+}
+
+// UnmarshalJSON handles both string and array content formats.
+func (m *Message) UnmarshalJSON(data []byte) error {
+	type messageAlias struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	var raw messageAlias
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	m.Role = raw.Role
+
+	// Try string content first.
+	var contentStr string
+	if err := json.Unmarshal(raw.Content, &contentStr); err == nil {
+		m.Content = []ContentBlock{{Type: "text", Text: contentStr}}
+		return nil
+	}
+
+	// Fall back to array of content blocks.
+	return json.Unmarshal(raw.Content, &m.Content)
 }
 
 type ContentBlock struct {

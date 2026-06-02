@@ -321,10 +321,14 @@ func (pm *ProviderManager) ResolveModel(modelName string) (*ResolvedRoute, error
 		if client == nil {
 			return nil, fmt.Errorf("provider %q (referenced by route %q) not configured", providerKey, modelName)
 		}
+		upstreamModel := route.Name
+		if upstreamModel == "" {
+			upstreamModel = modelName
+		}
 		return &ResolvedRoute{
 			Candidates: []ProviderCandidate{{
 				ProviderKey:   providerKey,
-				UpstreamModel: route.Name,
+				UpstreamModel: upstreamModel,
 				Protocol:      pm.ProtocolForKey(providerKey),
 				Client:        client,
 			}},
@@ -379,7 +383,27 @@ func (pm *ProviderManager) ResolveModel(modelName string) (*ResolvedRoute, error
 		return &ResolvedRoute{Candidates: candidates}, nil
 	}
 
-	// 4. No match
+	// 4. Fallback: pass through to any available provider with model name as-is.
+	// Prefer the default provider if one is configured, otherwise pick any provider.
+	providerKey := pm.defaultK
+	if providerKey == "" {
+		for k := range pm.clients {
+			providerKey = k
+			break
+		}
+	}
+	if client, ok := pm.clients[providerKey]; ok {
+		return &ResolvedRoute{
+			Candidates: []ProviderCandidate{{
+				ProviderKey:   providerKey,
+				UpstreamModel: modelName,
+				Protocol:      pm.ProtocolForKey(providerKey),
+				Client:        client,
+			}},
+		}, nil
+	}
+
+	// 5. No match and no default provider
 	return nil, fmt.Errorf("no route or provider found for model %q", modelName)
 }
 

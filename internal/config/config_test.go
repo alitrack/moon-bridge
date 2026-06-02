@@ -389,22 +389,6 @@ providers:
     api_key: openai-key
     protocol: openai-response
 `,
-		"empty route model": `
-mode: Transform
-models:
-  gpt-image-1.5: {}
-providers:
-  openai:
-    base_url: https://openai.example.test
-    api_key: openai-key
-    protocol: openai-response
-    offers:
-      - model: gpt-image-1.5
-routes:
-  image:
-    model: ""
-    provider: openai
-`,
 		"deepseek extension on openai-response protocol": `
 mode: Transform
 models:
@@ -647,8 +631,8 @@ cache:
 	}
 }
 
-func TestLoadFromYAMLRejectsEmptyRouteModel(t *testing.T) {
-	_, err := config.LoadFromYAML([]byte(`
+func TestLoadFromYAMLAcceptsPassThroughRoute(t *testing.T) {
+	cfg, err := config.LoadFromYAML([]byte(`
 mode: Transform
 providers:
   main:
@@ -659,8 +643,31 @@ routes:
     model: ""
     provider: main
 `))
+	if err != nil {
+		t.Fatalf("LoadFromYAML() error = %v, want nil (pass-through route)", err)
+	}
+	route, ok := cfg.Routes["moonbridge"]
+	if !ok {
+		t.Fatal("route moonbridge not found")
+	}
+	if route.Model != "moonbridge" {
+		t.Errorf("route.Model = %q, want %q (alias pass-through)", route.Model, "moonbridge")
+	}
+}
+
+func TestLoadFromYAMLRejectsRouteWithoutModelOrProvider(t *testing.T) {
+	_, err := config.LoadFromYAML([]byte(`
+mode: Transform
+providers:
+  main:
+    base_url: https://provider.example.test
+    api_key: upstream-key
+routes:
+  moonbridge:
+    model: ""
+`))
 	if err == nil {
-		t.Fatal("LoadFromYAML() error = nil, want empty route model error")
+		t.Fatal("LoadFromYAML() error = nil, want error for route without model or provider")
 	}
 }
 

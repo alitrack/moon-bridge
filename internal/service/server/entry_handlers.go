@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"context"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/protocol/chat"
 	"moonbridge/internal/service/provider"
+	visualpkg "moonbridge/internal/extension/visual"
 )
 
 // handleAnthropicMessages handles POST /v1/messages (Anthropic Messages API).
@@ -36,7 +38,12 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	var msgReq anthropic.MessageRequest
 	if err := json.Unmarshal(body, &msgReq); err != nil {
-		log.Warn("无效的 Anthropic 请求", "error", err)
+		preview := string(body)
+		if len(preview) > 500 {
+			preview = preview[:500] + "..."
+		}
+		log.Warn("无效的 Anthropic 请求", "error", err, "body_preview", preview)
+		os.WriteFile("/tmp/mb_anthropic_err.json", body, 0644)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
@@ -50,6 +57,13 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	if resolveErr != nil {
 		log.Warn("未知模型", "model", msgReq.Model)
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("unknown model: %q", msgReq.Model)})
+		return
+	}
+
+	msgReq = s.injectVisualDescriptions(r.Context(), msgReq)
+
+	if msgReq.Stream {
+		s.handleAnthropicMessagesStream(w, r, &msgReq, route)
 		return
 	}
 
@@ -97,6 +111,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if resolveErr != nil {
 		log.Warn("未知模型", "model", chatReq.Model)
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("unknown model: %q", chatReq.Model)})
+		return
+	}
+
+	if chatReq.Stream {
+		s.handleChatCompletionsStream(w, r, &chatReq, route)
 		return
 	}
 
@@ -281,6 +300,19 @@ func anthropicMessageToCore(req *anthropic.MessageRequest) *format.CoreRequest {
 		coreReq.ToolChoice = &format.CoreToolChoice{
 			Mode: req.ToolChoice.Type,
 			Name: req.ToolChoice.Name,
+		}
+	}
+	if req.Thinking != nil {
+		budget := req.Thinking.BudgetTokens
+		thinkType := req.Thinking.Type
+		// Claude Code sends "adaptive"+budget_tokens=0, which DeepSeek
+		// interprets as unlimited thinking. Disable it entirely for now.
+		if budget == 0 && thinkType == "adaptive" {
+			thinkType = "disabled"
+		}
+		coreReq.Thinking = &format.CoreThinkingConfig{
+			Type:         thinkType,
+			BudgetTokens: budget,
 		}
 	}
 	return coreReq
@@ -547,16 +579,57 @@ func toolResultToBlocks(content any) []anthropic.ContentBlock {
 	case []any:
 		var blocks []anthropic.ContentBlock
 		for _, item := range v {
-			if m, ok := item.(map[string]any); ok {
-				block := anthropic.ContentBlock{}
-				if t, _ := m["type"].(string); t != "" {
-					block.Type = t
-				}
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			block := anthropic.ContentBlock{}
+			if t, _ := m["type"].(string); t != "" {
+				block.Type = t
+			}
+			switch block.Type {
+			case "text":
 				if text, _ := m["text"].(string); text != "" {
 					block.Text = text
 				}
-				blocks = append(blocks, block)
+			case "image":
+				if src, ok := m["source"].(map[string]any); ok {
+					is := anthropic.ImageSource{}
+					if st, _ := src["type"].(string); st != "" {
+						is.Type = st
+					}
+					if mt, _ := src["media_type"].(string); mt != "" {
+						is.MediaType = mt
+					}
+					if d, _ := src["data"].(string); d != "" {
+						is.Data = d
+					}
+					if u, _ := src["url"].(string); u != "" {
+						is.URL = u
+					}
+					block.Source = &is
+				}
+			case "tool_use":
+				if id, _ := m["id"].(string); id != "" {
+					block.ID = id
+				}
+				if name, _ := m["name"].(string); name != "" {
+					block.Name = name
+				}
+				if input, ok := m["input"]; ok {
+					if raw, err := json.Marshal(input); err == nil {
+						block.Input = raw
+					}
+				}
+			case "tool_result":
+				if tid, _ := m["tool_use_id"].(string); tid != "" {
+					block.ToolUseID = tid
+				}
+				if inner, ok := m["content"]; ok {
+					block.Content = inner
+				}
 			}
+			blocks = append(blocks, block)
 		}
 		return blocks
 	}
@@ -601,4 +674,272 @@ func coreStatusToAnthropicStop(status string) string {
 
 func writeErrorJSON(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// handleAnthropicMessagesStream handles streaming Anthropic Messages requests.
+// Forwards upstream Anthropic SSE events as-is to the client.
+func (s *Server) handleAnthropicMessagesStream(
+	w http.ResponseWriter,
+	r *http.Request,
+	msgReq *anthropic.MessageRequest,
+	route *provider.ResolvedRoute,
+) {
+	ctx := r.Context()
+	log := slog.Default().With("model", msgReq.Model, "path", "messages_stream")
+	t0 := time.Now()
+
+	preferred, ok := route.Preferred()
+	if !ok {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "no available provider"})
+		return
+	}
+
+	client := preferred.Client
+	if client == nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "no upstream client"})
+		return
+	}
+
+	t1 := time.Now()
+	coreReq := anthropicMessageToCore(msgReq)
+	coreReq.Model = preferred.UpstreamModel
+
+	providerAdapter, ok := s.adapterRegistry.GetProvider(preferred.Protocol)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "no adapter"})
+		return
+	}
+	upstreamAny, err := providerAdapter.FromCoreRequest(ctx, coreReq)
+	if err != nil {
+		log.Error("转换失败", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	t2 := time.Now()
+
+	start := time.Now()
+	ch, err := client.StreamMessage(ctx, upstreamAny)
+	if err != nil {
+		log.Error("上游流式调用失败", "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+
+	for evtAny := range ch {
+		evt, ok := evtAny.(anthropic.StreamEvent)
+		if !ok {
+			continue
+		}
+		data, err := json.Marshal(evt)
+		if err != nil {
+			continue
+		}
+		if evt.Type != "" {
+			fmt.Fprintf(w, "event: %s\n", evt.Type)
+		}
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	log.Info("Anthropic Messages 流式完成",
+		"model", preferred.UpstreamModel,
+		"setup_ms", t2.Sub(t0).Milliseconds(),
+		"convert_ms", t2.Sub(t1).Milliseconds(),
+		"stream_ms", time.Since(start).Milliseconds(),
+		"total_ms", time.Since(t0).Milliseconds(),
+	)
+}
+
+// handleChatCompletionsStream handles streaming Chat Completions requests.
+func (s *Server) handleChatCompletionsStream(
+	w http.ResponseWriter,
+	r *http.Request,
+	chatReq *chat.ChatRequest,
+	route *provider.ResolvedRoute,
+) {
+	ctx := r.Context()
+	log := slog.Default().With("model", chatReq.Model, "path", "chat_stream")
+
+	preferred, ok := route.Preferred()
+	if !ok {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "no available provider"})
+		return
+	}
+
+	chatClientRaw := s.activeChatClient(preferred.ProviderKey)
+	if chatClientRaw == nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "no chat client"})
+		return
+	}
+	chatClient, ok := chatClientRaw.(*chat.Client)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "invalid chat client"})
+		return
+	}
+
+	chatReq.Model = preferred.UpstreamModel
+
+	start := time.Now()
+	ch, err := chatClient.StreamChat(ctx, chatReq)
+	if err != nil {
+		log.Error("Chat 流式调用失败", "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+
+	for chunk := range ch {
+		data, err := json.Marshal(chunk)
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	log.Info("Chat Completions 流式完成", "model", preferred.UpstreamModel, "duration", time.Since(start))
+}
+
+// injectVisualDescriptions checks if visual extension is enabled for the model,
+// extracts images from the request, calls the vision model for descriptions,
+// and injects text descriptions in place of image blocks.
+func (s *Server) injectVisualDescriptions(ctx context.Context, req anthropic.MessageRequest) anthropic.MessageRequest {
+	// Only process images in the LATEST user message — avoid re-describing
+	// conversation history images on every turn (4×10s Qwen VL calls).
+	lastUserIdx := -1
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == "user" {
+			lastUserIdx = i
+			break
+		}
+	}
+	if lastUserIdx < 0 {
+		return req
+	}
+
+	hasImages := false
+	for _, block := range req.Messages[lastUserIdx].Content {
+		if block.Type == "image" && block.Source != nil {
+			hasImages = true
+			break
+		}
+	}
+	if !hasImages {
+		return req
+	}
+
+	if s.runtime == nil {
+		return req
+	}
+	cfgV := s.runtime.Current().Config
+	visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, req.Model)
+	if !visOk || visCfg.Provider == "" || visCfg.Model == "" {
+		return req
+	}
+
+	chatClientRaw := s.activeChatClient(visCfg.Provider)
+	if chatClientRaw == nil {
+		return req
+	}
+	chatClient, ok := chatClientRaw.(*chat.Client)
+	if !ok {
+		return req
+	}
+
+	modified := false
+	msg := &req.Messages[lastUserIdx]
+	var newContent []anthropic.ContentBlock
+	for _, block := range msg.Content {
+		if block.Type != "image" || block.Source == nil {
+			newContent = append(newContent, block)
+			continue
+		}
+		desc, err := s.describeImage(ctx, chatClient, visCfg, block.Source)
+		if err != nil {
+			slog.Default().Warn("visual description failed", "error", err)
+			newContent = append(newContent, block)
+			continue
+		}
+		newContent = append(newContent, anthropic.ContentBlock{
+			Type: "text",
+			Text: "[Image description from vision model (" + block.Source.MediaType + ")]\n" + desc,
+		})
+		modified = true
+	}
+	msg.Content = newContent
+
+	if modified {
+		slog.Default().Info("visual descriptions injected", "model", req.Model)
+	}
+	return req
+}
+
+func (s *Server) describeImage(ctx context.Context, chatClient *chat.Client,
+	visCfg visualpkg.Config, source *anthropic.ImageSource,
+) (string, error) {
+	var imgURL string
+	switch source.Type {
+	case "base64":
+		imgURL = "data:" + source.MediaType + ";base64," + source.Data
+	case "url":
+		imgURL = source.URL
+	default:
+		if source.Data != "" {
+			imgURL = "data:" + source.MediaType + ";base64," + source.Data
+		} else if source.URL != "" {
+			imgURL = source.URL
+		} else {
+			return "", fmt.Errorf("no image data")
+		}
+	}
+
+	chatReq := &chat.ChatRequest{
+		Model: visCfg.Model,
+		Messages: []chat.ChatMessage{
+			{
+				Role: "user",
+				Content: []chat.ContentPart{
+					{Type: "text", Text: "Describe this image in detail. What do you see?"},
+					{Type: "image_url", ImageURL: &chat.ImageURL{URL: imgURL}},
+				},
+			},
+		},
+		MaxTokens: visCfg.MaxTokens,
+	}
+	if chatReq.MaxTokens <= 0 {
+		chatReq.MaxTokens = 1024
+	}
+
+	resp, err := chatClient.CreateChat(ctx, chatReq)
+	if err != nil {
+		return "", fmt.Errorf("vision API error: %w", err)
+	}
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("no response from vision model")
+	}
+	content, _ := resp.Choices[0].Message.Content.(string)
+	if content == "" {
+		return "", fmt.Errorf("empty response from vision model")
+	}
+	return content, nil
 }
