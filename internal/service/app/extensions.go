@@ -14,6 +14,8 @@ import (
 	codextoolproxy "moonbridge/internal/extension/codex_tool_proxy"
 	"moonbridge/internal/extension/plugin"
 	responsestore "moonbridge/internal/extension/response_store"
+	sessionrecorder "moonbridge/internal/extension/session_recorder"
+	skillinjector "moonbridge/internal/extension/skill_injector"
 	"moonbridge/internal/extension/visual"
 	webfetch "moonbridge/internal/extension/web_fetch"
 	"moonbridge/internal/config"
@@ -46,6 +48,8 @@ func (cat BuiltinExtensionCatalog) ConfigSpecs() []config.ExtensionConfigSpec {
 	specs = append(specs, circuitbreaker.ConfigSpecs()...)
 	specs = append(specs, contextmanager.ConfigSpecs()...)
 	specs = append(specs, responsestore.ConfigSpecs()...)
+	specs = append(specs, sessionrecorder.ConfigSpecs()...)
+	specs = append(specs, skillinjector.ConfigSpecs()...)
 	return specs
 }
 
@@ -73,5 +77,7 @@ func (cat BuiltinExtensionCatalog) NewRegistry(logger *slog.Logger, cfg config.C
 	registry.Register(circuitbreaker.NewPlugin())
 	registry.Register(contextmanager.NewPlugin())
 	registry.Register(responsestore.NewPlugin())
+	registry.Register(sessionrecorder.NewPlugin())
+	registry.Register(skillinjector.NewPlugin())
 	return registry
 }

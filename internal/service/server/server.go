@@ -161,7 +161,7 @@ func New(cfg Config) *Server {
 	s.mux.HandleFunc("/v1/models", s.handleModels)
 	s.mux.HandleFunc("/models", s.handleModels)
 	s.registerPluginRoutes()
-	if cfg.Runtime != nil && cfg.Store != nil {
+	if cfg.Runtime != nil {
 		apiRouter := api.NewRouter(s.store, s.runtime, s.stats, s.pluginRegistry, s)
 		s.mux.Handle("/api/v1/", http.StripPrefix("/api/v1", apiRouter))
 	}
@@ -357,6 +357,25 @@ func checkAuth(r *http.Request, expectedToken string) bool {
 }
 
 func (s *Server) resolveModelOrFallback(modelName string) (*provider.ResolvedRoute, error) {
+	// Check runtime provider mode override (POST /v1/admin/mode).
+	if s.runtime != nil {
+		if mode := s.runtime.ProviderMode(); mode != "" {
+			pm := s.activeProviderManager()
+			if pm != nil {
+				if client, err := pm.ClientForKey(mode); err == nil {
+					return &provider.ResolvedRoute{
+						Candidates: []provider.ProviderCandidate{{
+							ProviderKey:   mode,
+							UpstreamModel: modelName,
+							Protocol:      "anthropic",
+							Client:        client,
+						}},
+					}, nil
+				}
+			}
+		}
+	}
+
 	if pm := s.activeProviderManager(); pm != nil {
 		return pm.ResolveModel(modelName)
 	}
