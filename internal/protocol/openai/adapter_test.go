@@ -294,8 +294,8 @@ func TestToCoreRequest_BatchesCustomToolCallsAndOutputsIntoSingleRound(t *testin
 	for i, want := range []struct {
 		assistantTextIdx int
 		msgIdx           int
-		callID  string
-		outcome string
+		callID           string
+		outcome          string
 	}{
 		{0, 1, "call_a", "ok a"},
 		{3, 4, "call_b", "ok b"},
@@ -345,7 +345,13 @@ func TestFromCoreStream_NoDuplicateDoneForToolUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stream := streamAny.(<-chan openai.StreamEvent)
+	var stream <-chan openai.StreamEvent
+	oaiResult, ok := streamAny.(*openai.OpenAIStreamResult)
+	if ok {
+		stream = oaiResult.Chan()
+	} else {
+		stream = streamAny.(<-chan openai.StreamEvent)
+	}
 	var argsDone int
 	var itemDone int
 	for ev := range stream {

@@ -47,8 +47,14 @@ type AnthropicProviderAdapter struct {
 	cacheMgr     CacheManager
 	hooks        format.CorePluginHooks
 
-	streamMu     sync.Mutex
-	streamEvents []StreamEvent
+	// cacheKeyMu guards cacheKeyStore, which maps context pointers to cache
+	// key/ttl pairs computed during PlanAndInject and consumed during ToCoreResponse.
+	cacheKeyMu    sync.Mutex
+	cacheKeyStore map[string]cacheKeyEntry
+}
+
+type cacheKeyEntry struct {
+	key, ttl string
 }
 
 // NewAnthropicProviderAdapter creates a new AnthropicProviderAdapter.
@@ -57,9 +63,10 @@ type AnthropicProviderAdapter struct {
 // if caching is not needed.
 func NewAnthropicProviderAdapter(cfgMaxTokens int, cacheMgr CacheManager, hooks format.CorePluginHooks) *AnthropicProviderAdapter {
 	return &AnthropicProviderAdapter{
-		cfgMaxTokens: cfgMaxTokens,
-		cacheMgr:     cacheMgr,
-		hooks:        hooks.WithDefaults(),
+		cfgMaxTokens:  cfgMaxTokens,
+		cacheMgr:      cacheMgr,
+		hooks:         hooks.WithDefaults(),
+		cacheKeyStore: make(map[string]cacheKeyEntry),
 	}
 }
 
@@ -294,6 +301,11 @@ func (a *AnthropicProviderAdapter) FromCoreRequest(ctx context.Context, req *for
 			Role:    a.mapRole(msg.Role),
 			Content: a.toContentBlocks(msg.Content),
 		}
+		// Skip messages with no content blocks — they are empty and contribute
+		// no semantic value to the upstream API.
+		if len(anthroMsg.Content) == 0 {
+			continue
+		}
 		last := len(anthropicReq.Messages) - 1
 		if last >= 0 && anthroMsg.Role == "user" &&
 			anthropicReq.Messages[last].Role == "user" &&
@@ -304,6 +316,15 @@ func (a *AnthropicProviderAdapter) FromCoreRequest(ctx context.Context, req *for
 		} else {
 			anthropicReq.Messages = append(anthropicReq.Messages, anthroMsg)
 		}
+	}
+
+	// Ensure first message has role "user" — Anthropic API rejects requests
+	// where the first message is assistant, tool, or any non-user role.
+	if len(anthropicReq.Messages) > 0 && anthropicReq.Messages[0].Role != "user" {
+		anthropicReq.Messages = append(
+			[]Message{{Role: "user", Content: []ContentBlock{{Type: "text", Text: "_"}}}},
+			anthropicReq.Messages...,
+		)
 	}
 
 	// Tools
@@ -335,7 +356,13 @@ func (a *AnthropicProviderAdapter) FromCoreRequest(ctx context.Context, req *for
 	// Step 3: Cache planning via CacheManager.
 	// PlanAndInject may modify anthropicReq in-place by setting cache_control
 	// on tools, system blocks, messages, or the request-level field.
-	a.cacheMgr.PlanAndInject(ctx, &anthropicReq, req)
+	key, ttl := a.cacheMgr.PlanAndInject(ctx, &anthropicReq, req)
+
+	// Store cache key/ttl for retrieval in ToCoreResponse.
+	ctxKey := fmt.Sprintf("%p", ctx)
+	a.cacheKeyMu.Lock()
+	a.cacheKeyStore[ctxKey] = cacheKeyEntry{key: key, ttl: ttl}
+	a.cacheKeyMu.Unlock()
 
 	return &anthropicReq, nil
 }
@@ -386,10 +413,19 @@ func (a *AnthropicProviderAdapter) ToCoreResponse(ctx context.Context, resp any)
 	}
 
 	// Update cache registry from usage signals via CacheManager.
-	// The key/ttl were computed during PlanAndInject and must be accessible
-	// through the CacheManager's own state (or context).
+	// The key/ttl were computed during PlanAndInject and are retrieved
+	// from the per-request cache key store.
 	if a.cacheMgr != nil {
-		a.cacheMgr.UpdateRegistry(ctx, "", "", msgResp.Usage)
+		ctxKey := fmt.Sprintf("%p", ctx)
+		a.cacheKeyMu.Lock()
+		entry, ok := a.cacheKeyStore[ctxKey]
+		delete(a.cacheKeyStore, ctxKey)
+		a.cacheKeyMu.Unlock()
+		if ok {
+			a.cacheMgr.UpdateRegistry(ctx, entry.key, entry.ttl, msgResp.Usage)
+		} else {
+			a.cacheMgr.UpdateRegistry(ctx, "", "", msgResp.Usage)
+		}
 	}
 
 	return coreResp, nil
@@ -422,15 +458,18 @@ type streamConverterState struct {
 	blockTypes      map[int]string            // content index → block type
 	blockSignatures map[int]string            // content index → reasoning signature (from signature_delta)
 	finalUsage      *format.CoreUsage         // tracked from message_delta, passed to message_stop
-	adapter         *AnthropicProviderAdapter // for buffering raw stream events (trace)
+	adapter         *AnthropicProviderAdapter // for plugin hooks
 	suppressText    map[int]bool              // text indices to suppress (server-side search status, etc.)
+	buf             *[]StreamEvent            // per-stream event buffer (local, not shared)
+	bufMu           *sync.Mutex               // guards buf
+	ctx             context.Context           // for context-aware channel sends
 }
 
 // ToCoreStream consumes an anthropic.Stream and returns a channel of CoreStreamEvent.
 //
 // The adapter owns the read-loop goroutine. The returned channel is closed when
 // the stream ends, context is cancelled, or an error occurs.
-func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (<-chan format.CoreStreamEvent, error) {
+func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (*format.StreamResult, error) {
 	stream, ok := src.(Stream)
 	if !ok {
 		return nil, fmt.Errorf("anthropic adapter: expected anthropic.Stream, got %T", src)
@@ -438,13 +477,14 @@ func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (<
 	ctx = coreHookContext(ctx, "")
 	events := make(chan format.CoreStreamEvent, 64)
 
-	// Initialize stream event buffer for trace capture.
-	a.streamMu.Lock()
-	a.streamEvents = make([]StreamEvent, 0, 64)
-	a.streamMu.Unlock()
+	// Per-stream buffer — local to this call, not shared across concurrent requests.
+	var buf []StreamEvent
+	var bufMu sync.Mutex
+	bufReady := make(chan struct{})
 
 	go func() {
 		defer close(events)
+		defer close(bufReady)
 		defer stream.Close()
 
 		state := &streamConverterState{
@@ -452,6 +492,9 @@ func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (<
 			blockSignatures: make(map[int]string),
 			adapter:         a,
 			suppressText:    make(map[int]bool),
+			buf:             &buf,
+			bufMu:           &bufMu,
+			ctx:             ctx,
 		}
 
 		for {
@@ -464,10 +507,8 @@ func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (<
 			ev, err := stream.Next()
 			if err != nil {
 				if err == io.EOF {
-					// Stream ended normally.
 					return
 				}
-				// Context cancellation is clean shutdown, not a failure.
 				if err == context.Canceled || err == context.DeadlineExceeded {
 					return
 				}
@@ -480,11 +521,30 @@ func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (<
 				return
 			}
 
+			// Check context immediately after Next() to close the race window.
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			state.convertEvent(events, ev)
 		}
 	}()
 
-	return events, nil
+	return &format.StreamResult{
+		Events: events,
+		StreamBuffer: func() []any {
+			<-bufReady
+			bufMu.Lock()
+			defer bufMu.Unlock()
+			result := make([]any, len(buf))
+			for i, ev := range buf {
+				result[i] = ev
+			}
+			return result
+		},
+	}, nil
 }
 
 // =========================================================================
@@ -498,13 +558,24 @@ func (s *streamConverterState) nextSeq() int64 {
 
 func (s *streamConverterState) emit(events chan<- format.CoreStreamEvent, ev format.CoreStreamEvent) {
 	ev.SeqNum = s.nextSeq()
-	events <- ev
+	if s.ctx != nil {
+		select {
+		case <-s.ctx.Done():
+		case events <- ev:
+		}
+	} else {
+		events <- ev
+	}
 }
 
 func (s *streamConverterState) convertEvent(events chan<- format.CoreStreamEvent, ev StreamEvent) {
-	// Buffer the original event for trace (max 4MB).
-	if s.adapter != nil {
-		s.adapter.bufferStreamEvent(ev)
+	// Buffer the original event for trace in the per-stream local buffer.
+	if s.bufMu != nil && s.buf != nil {
+		s.bufMu.Lock()
+		if len(*s.buf) < 1024 {
+			*s.buf = append(*s.buf, ev)
+		}
+		s.bufMu.Unlock()
 	}
 	switch ev.Type {
 	case "message_start":
@@ -743,7 +814,7 @@ func (a *AnthropicProviderAdapter) toContentBlock(b format.CoreContentBlock) Con
 		}
 
 	case "tool_result":
-		var content any
+		var content any = ""
 		if len(b.ToolResultContent) > 0 {
 			content = a.toContentBlocks(b.ToolResultContent)
 		}
@@ -971,20 +1042,15 @@ func (a *AnthropicProviderAdapter) mapStopReasonToStatus(reason string) string {
 // bufferStreamEvent buffers the raw anthropic stream event for trace capture,
 // up to the 4MB limit. The event is JSON-marshalled to estimate its size.
 func (a *AnthropicProviderAdapter) bufferStreamEvent(ev StreamEvent) {
-	a.streamMu.Lock()
-	defer a.streamMu.Unlock()
-	// Cap buffer at 1024 events (~4MB estimation) to prevent unbounded memory growth.
-	if len(a.streamEvents) >= 1024 {
-		return
-	}
-	a.streamEvents = append(a.streamEvents, ev)
+	// streamConverterState captures buf/bufMu from the goroutine closure.
+	// This is a no-op without a per-stream buffer — use the state.bufferStreamEvent instead.
 }
 
 // StreamBuffer returns the buffered stream events for trace capture.
 func (a *AnthropicProviderAdapter) StreamBuffer() []StreamEvent {
-	a.streamMu.Lock()
-	defer a.streamMu.Unlock()
-	return a.streamEvents
+	// Deprecated: use StreamResult.StreamBuffer instead.
+	// This method will be removed after all callers migrate.
+	return nil
 }
 
 // RememberStreamContent stores response content from a stream for plugin state tracking.

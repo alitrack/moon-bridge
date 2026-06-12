@@ -1730,7 +1730,7 @@ func TestToCoreStream_BasicDelta(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 
@@ -1790,7 +1790,7 @@ func TestToCoreStream_ToolCallArgsDelta(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 
@@ -1819,7 +1819,7 @@ func TestToCoreStream_EmptyChunk(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 
@@ -1842,7 +1842,7 @@ func TestToCoreStream_NoContent(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 
@@ -1869,7 +1869,7 @@ func TestToCoreStream_ContextCancel(t *testing.T) {
 
 	// Events channel should close immediately due to cancelled context.
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 	if len(evts) != 0 {
@@ -1915,7 +1915,7 @@ func TestToCoreStream_MultiChoice(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 
@@ -2290,7 +2290,7 @@ func TestToCoreStream_WithModel(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 	if len(evts) < 4 {
@@ -2318,7 +2318,7 @@ func TestToCoreStream_ContentBlockStartedNoRole(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 	if len(evts) < 3 {
@@ -2370,7 +2370,7 @@ func TestToCoreStream_ToolCallArgsDeltaByPosition(t *testing.T) {
 		t.Fatal(err)
 	}
 	var deltas []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		if e.Type == format.CoreToolCallArgsDelta {
 			deltas = append(deltas, e)
 		}
@@ -2428,7 +2428,7 @@ func TestToCoreStream_ToolCallArgsDeltaRespectsExplicitToolIndex(t *testing.T) {
 	}
 	var started []format.CoreStreamEvent
 	var deltas []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		if e.Type == format.CoreContentBlockStarted && e.ContentBlock != nil && e.ContentBlock.Type == "tool_use" {
 			started = append(started, e)
 		}

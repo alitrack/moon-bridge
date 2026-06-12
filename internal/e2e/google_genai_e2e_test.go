@@ -64,8 +64,8 @@ func TestGoogleGenaiE2E_TextRoundTrip(t *testing.T) {
 
 	// Step 1: Build OpenAI Responses request.
 	openAIReq := openai.ResponsesRequest{
-		Model:          "gemini-2.0-flash",
-		Input:          json.RawMessage(`"Hello"`),
+		Model:           "gemini-2.0-flash",
+		Input:           json.RawMessage(`"Hello"`),
 		MaxOutputTokens: 100,
 	}
 
@@ -395,10 +395,10 @@ func TestGoogleGenaiE2E_Streaming(t *testing.T) {
 
 	// Step 1: Build streaming OpenAI request.
 	openAIReq := openai.ResponsesRequest{
-		Model:          "gemini-2.0-flash",
-		Input:          json.RawMessage(`"Hello streaming"`),
+		Model:           "gemini-2.0-flash",
+		Input:           json.RawMessage(`"Hello streaming"`),
 		MaxOutputTokens: 100,
-		Stream:         true,
+		Stream:          true,
 	}
 
 	// Step 2: ClientAdapter.ToCoreRequest.
@@ -446,11 +446,17 @@ func TestGoogleGenaiE2E_Streaming(t *testing.T) {
 	}
 
 	// Step 5: ClientStreamAdapter.FromCoreStream.
-	streamOutAny, err := clientStream.FromCoreStream(ctx, coreReq, coreEvents)
+	streamOutAny, err := clientStream.FromCoreStream(ctx, coreReq, coreEvents.Events)
 	if err != nil {
 		t.Fatalf("FromCoreStream: %v", err)
 	}
-	openAIStream := streamOutAny.(<-chan openai.StreamEvent)
+	var openAIStream <-chan openai.StreamEvent
+	oaiResult, ok := streamOutAny.(*openai.OpenAIStreamResult)
+	if ok {
+		openAIStream = oaiResult.Chan()
+	} else {
+		openAIStream = streamOutAny.(<-chan openai.StreamEvent)
+	}
 
 	// Consume the OpenAI stream and verify expected events.
 	var seenEvents []string
@@ -532,8 +538,8 @@ func TestGoogleGenaiE2E_ErrorResponse(t *testing.T) {
 	defer mockSrv.Close()
 
 	openAIReq := openai.ResponsesRequest{
-		Model:          "gemini-2.0-flash",
-		Input:          json.RawMessage(`"Hello"`),
+		Model:           "gemini-2.0-flash",
+		Input:           json.RawMessage(`"Hello"`),
 		MaxOutputTokens: 100,
 	}
 

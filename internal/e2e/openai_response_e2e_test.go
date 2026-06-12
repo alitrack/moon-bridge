@@ -311,8 +311,8 @@ func TestOpenAIResponsePassthroughE2E_Streaming(t *testing.T) {
 
 	// content_block.started (text type)
 	events <- format.CoreStreamEvent{
-		Type:   format.CoreContentBlockStarted,
-		Index:  0,
+		Type:         format.CoreContentBlockStarted,
+		Index:        0,
 		ContentBlock: &format.CoreContentBlock{Type: "text"},
 	}
 	// text delta
@@ -347,7 +347,13 @@ func TestOpenAIResponsePassthroughE2E_Streaming(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FromCoreStream: %v", err)
 	}
-	openAIStream := streamOutAny.(<-chan openai.StreamEvent)
+	var openAIStream <-chan openai.StreamEvent
+	oaiResult, ok := streamOutAny.(*openai.OpenAIStreamResult)
+	if ok {
+		openAIStream = oaiResult.Chan()
+	} else {
+		openAIStream = streamOutAny.(<-chan openai.StreamEvent)
+	}
 
 	// Step 3: Consume and verify.
 	var seenEvents []string
