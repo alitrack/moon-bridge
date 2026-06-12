@@ -151,6 +151,7 @@ func (p *Plugin) RegisterRoutes(register func(pattern string, handler http.Handl
 		return
 	}
 	register("GET /v1/admin/metrics", http.HandlerFunc(p.handleQuery))
+	register("GET /v1/admin/metrics/summary", http.HandlerFunc(p.handleSummary))
 }
 
 func (p *Plugin) handleQuery(w http.ResponseWriter, r *http.Request) {
@@ -224,6 +225,39 @@ func (p *Plugin) handleQuery(w http.ResponseWriter, r *http.Request) {
 		"records": records,
 		"count":   len(records),
 	})
+}
+
+func (p *Plugin) handleSummary(w http.ResponseWriter, r *http.Request) {
+	if p.metricsStore == nil {
+		http.Error(w, `{"error":"metrics disabled"}`, http.StatusNotFound)
+		return
+	}
+
+	opts := SummaryOptions{}
+	if since := r.URL.Query().Get("since"); since != "" {
+		if t, err := time.Parse(time.RFC3339Nano, since); err == nil {
+			opts.Since = t
+		}
+	}
+	if until := r.URL.Query().Get("until"); until != "" {
+		if t, err := time.Parse(time.RFC3339Nano, until); err == nil {
+			opts.Until = t
+		}
+	}
+
+	summary, err := p.metricsStore.Summary(opts)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if summary == nil {
+		summary = &Summary{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(summary)
 }
 
 func pluginExtensionEnabled(pluginCfg config.PluginConfig, name string) bool {

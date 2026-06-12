@@ -420,3 +420,113 @@ models:
   my-model:
     web_search:
       support: "enabled"  # 覆盖提供商级别的 injected
+
+## session_recorder（请求日志记录）
+
+记录每次 LLM 请求的模型、实际模型、提供商、token、耗时和状态，按日写入 JSONL 文件。
+
+**位置**：`internal/extension/session_recorder/`
+
+**文件清单**：
+
+| 文件 | 用途 |
+|------|------|
+| `plugin.go` | Plugin 实现，包含 `OnRequestCompleted` |
+
+**实现的能力**：
+
+```go
+var (
+    _ plugin.Plugin                = (*Plugin)(nil)
+    _ plugin.RequestCompletionHook = (*Plugin)(nil)
+    _ plugin.ConfigSpecProvider    = (*Plugin)(nil)
+)
+```
+
+### 数据格式
+
+```jsonl
+{"timestamp":"2026-06-12T03:01:39.146Z","model":"deepseek-v4-flash","actual_model":"deepseek-v4-flash","provider":"deepseek","input_tokens":262,"output_tokens":59,"cost":0,"status":"success","duration_ms":1308}
+{"timestamp":"2026-06-12T03:01:46.597Z","model":"deepseek-v4-flash","actual_model":"deepseek-v4-flash","provider":"deepseek","input_tokens":262,"output_tokens":10,"cost":0,"status":"success","duration_ms":664}
+```
+
+### 配置
+
+```yaml
+extensions:
+  session_recorder:
+    config:
+      output_dir: ~/.moonbridge/sessions  # 默认，可选自定义
+      max_days: 7                          # 旧文件自动清理，0=不清理
+```
+
+默认输出到 `~/.moonbridge/sessions/sessions-YYYY-MM-DD.jsonl`。支持模型级和全局两级作用域。
+
+---
+
+## skill_injector（技能注入）
+
+从 `~/.moonbridge/skills/<name>/SKILL.md` 读取 Anthropic Agent Skills 格式的技能文件，通过关键词匹配用户请求，将最相关的技能注入 system prompt。
+
+**位置**：`internal/extension/skill_injector/`
+
+**文件清单**：
+
+| 文件 | 用途 |
+|------|------|
+| `plugin.go` | Plugin 实现，包含 `MutateCoreRequest`、SKILL.md 解析器、关键词匹配引擎 |
+
+**实现的能力**：
+
+```go
+var (
+    _ plugin.Plugin             = (*Plugin)(nil)
+    _ plugin.CoreRequestMutator = (*Plugin)(nil)
+    _ plugin.ConfigSpecProvider = (*Plugin)(nil)
+)
+```
+
+### SKILL.md 格式
+
+技能目录结构：
+```
+~/.moonbridge/skills/
+  debug-systematically/
+    SKILL.md
+  my-skill/
+    SKILL.md
+```
+
+每个 SKILL.md 必须包含 YAML frontmatter：
+
+```yaml
+---
+name: debug-systematically
+description: Systematic 4-phase root cause debugging workflow
+category: software-development
+---
+
+## Systematic Debugging
+
+1. Understand the error before fixing...
+```
+
+`name` 和 `description` 是关键词匹配的检索字段。`category` 可选，用于后续按分类筛选。
+
+### 匹配策略
+
+1. **关键词匹配**：从用户最后一条消息提取 tokens，与所有技能的 `name` + `description` 做 token 交集匹配，按匹配数排序取 Top-3
+2. **Fallback**：如果关键词匹配返回 0 条，fallback 到技能库的 Top-3（按加载顺序，稳定）
+
+### 配置
+
+```yaml
+extensions:
+  skill_injector:
+    config:
+      skills_dir: ~/.moonbridge/skills  # 默认
+      top_k: 3
+      retrieval_mode: template           # 当前仅支持 template（关键词匹配）
+```
+
+默认关闭，需在模型或全局级启用 `enabled: true`。技能目录变更后需重启 moonbridge 重新加载。

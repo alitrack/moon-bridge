@@ -48,6 +48,8 @@ go run ./cmd/moonbridge -config config.yml
 | `visual` | ContentFilter | 视觉/图片内容过滤 |
 | `db_sqlite` / `db_d1` | Provider | SQLite / Cloudflare D1 持久化存储 |
 | `metrics` | RequestCompletionHook | Token 用量与费用统计 |
+| `session_recorder` | RequestCompletionHook | 记录每次请求的模型、token、耗时到 `~/.moonbridge/sessions/YYYY-MM-DD.jsonl` |
+| `skill_injector` | CoreRequestMutator | 从 `~/.moonbridge/skills/<name>/SKILL.md` 读取技能，关键词匹配后注入 system prompt，无匹配时 fallback 到 Top-3 |
 
 ### 配置示例
 

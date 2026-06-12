@@ -31,6 +31,11 @@ type ConfigSnapshot struct {
 type Runtime struct {
 	snapshot atomic.Pointer[ConfigSnapshot]
 	mu       sync.Mutex // guards Reload; not needed for Current()
+
+	// providerMode allows runtime override of all provider routing.
+	// Empty string means no override (use normal route resolution).
+	// When set to a provider key, ALL model resolution uses that provider.
+	providerMode atomic.Pointer[string]
 }
 
 // NewRuntime creates a Runtime with the given initial configuration.
@@ -86,4 +91,22 @@ func (rt *Runtime) Reload(cfg config.Config) error {
 	}
 	rt.snapshot.Store(snapshot)
 	return nil
+}
+
+// SetProviderMode overrides all provider routing to use the given provider key.
+// Pass empty string to restore normal route resolution.
+func (rt *Runtime) SetProviderMode(mode string) {
+	if mode == "" {
+		rt.providerMode.Store(nil)
+	} else {
+		rt.providerMode.Store(&mode)
+	}
+}
+
+// ProviderMode returns the current provider mode override, or empty string if none.
+func (rt *Runtime) ProviderMode() string {
+	if p := rt.providerMode.Load(); p != nil {
+		return *p
+	}
+	return ""
 }

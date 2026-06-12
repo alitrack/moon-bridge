@@ -29,6 +29,7 @@ import (
 // Used by Claude Code, Claude API clients, etc.
 func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	log := slog.Default().With("path", r.URL.Path, "method", r.Method, "remote", r.RemoteAddr)
+	requestStart := time.Now()
 
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -83,11 +84,21 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	outMsg := coreToAnthropicResponse(coreResp)
 	outMsg.Model = coreResp.Model
 	writeJSON(w, http.StatusOK, outMsg)
+
+	if pref, ok := route.Preferred(); ok {
+		usage := usageFromAnthropic(string(pref.Protocol), "core_dispatch", coreResp.Usage, false)
+		s.onRequestCompleted(
+			msgReq.Model, coreResp.Model, pref.ProviderKey,
+			requestStart, usage,
+			0, "success", "",
+		)
+	}
 }
 
 // handleChatCompletions handles POST /v1/chat/completions (OpenAI Chat API).
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	log := slog.Default().With("path", r.URL.Path, "method", r.Method, "remote", r.RemoteAddr)
+	requestStart := time.Now()
 
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -135,6 +146,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	outChat := coreToChatResponse(coreResp)
 	outChat.Model = coreResp.Model
 	writeJSON(w, http.StatusOK, outChat)
+
+	if pref, ok := route.Preferred(); ok {
+		usage := usageFromAnthropic(string(pref.Protocol), "core_dispatch", coreResp.Usage, false)
+		s.onRequestCompleted(
+			chatReq.Model, coreResp.Model, pref.ProviderKey,
+			requestStart, usage,
+			0, "success", "",
+		)
+	}
 }
 
 // dispatchCoreRequest runs the adapter pipeline and returns a CoreResponse.
