@@ -45,7 +45,7 @@ go run ./cmd/moonbridge -config config.yml
 | `circuit_breaker` | RequestMutator | 按会话统计连续 tool_use 调用次数，超过阈值注入警告或强制终止，防止模型陷入死循环 |
 | `response_store` | ResponsePostProcessor | 缓存上游响应，当请求携带 `previous_response_id` 时自动桥接上次 assistant 输出到新请求 Input |
 | `kimi_workaround` | InputPreprocessor | Kimi 模型兼容处理 |
-| `visual` | ContentFilter | 视觉/图片内容过滤 |
+|| `visual` | ContentFilter + ToolInjector | 为纯文本模型注入 `visual_brief` / `visual_qa` 工具，自动剥离图片 block，路由到视觉模型分析后回填结果。支持 5 种场景的自动检测（错误日志/图表/问题定位/UI 布局/OCR），输出特化分析指令 |
 | `db_sqlite` / `db_d1` | Provider | SQLite / Cloudflare D1 持久化存储 |
 | `metrics` | RequestCompletionHook | Token 用量与费用统计 |
 | `session_recorder` | RequestCompletionHook | 记录每次请求的模型、token、耗时到 `~/.moonbridge/sessions/YYYY-MM-DD.jsonl` |
@@ -67,6 +67,31 @@ extensions:
     config:
       ttl_seconds: 3600
       max_entries: 500
+```
+
+### Visual 扩展（场景感知图像分析）
+
+为纯文本模型（如 DeepSeek V4）赋予图像理解能力。模型通过 `visual_brief` / `visual_qa` 工具调用视觉模型，支持自动场景检测与特化 prompt：
+
+| 场景 | 触发关键词 | 输出特化 |
+|------|-----------|---------|
+| 错误日志 (C) | error, stack, crash, 500, panic | **逐字提取**，保留栈层级与文件路径 |
+| 图表数据 (E) | chart, trend, bar chart, pie | 提取数据点、轴标签、趋势、异常 |
+| 问题定位 (B) | fix, bug, red box, arrow, wrong | 标记定位 + 症状分析 + 修复建议 |
+| UI 布局 (A) | html, page, mockup, figma, css | 像素级描述 + **ASCII 布局图** |
+| 文字提取 (D) | ocr, extract text, transcribe | 全文逐字输出，保留层级与角色 |
+
+检测优先级：错误日志 > 图表 > 问题定位 > UI 布局 > 文字提取。
+
+```yaml
+extensions:
+  visual:
+    enabled: true
+    config:
+      provider: "openai"      # 视觉模型所在的 provider 名称
+      model: "gpt-4o"         # 视觉模型名
+      max_rounds: 4           # 最大多轮追问次数（默认 4）
+      max_tokens: 2048        # 单次分析最大输出 token
 ```
 
 ## 三种工作模式
