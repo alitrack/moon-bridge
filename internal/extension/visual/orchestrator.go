@@ -306,9 +306,61 @@ func analysisRequestFromToolUse(toolUse anthropic.ContentBlock, availableImages 
 	}
 }
 
+// visualMode represents one of the five scene-specific analysis modes.
+// Priority order (highest→lowest): modeErrorLog > modeChart > modeIssue > modeUILayout > modeOCR > modeDefault.
+// Inspired by the OpenCode Observer plugin's multi-scene design (Peng Qian, Data Leads Future).
+type visualMode int
+
+const (
+	modeDefault  visualMode = iota
+	modeErrorLog            // C: error stacks, crash logs, exceptions
+	modeChart               // E: charts, data visualization
+	modeIssue               // B: bug marks, red boxes, arrows
+	modeUILayout            // A: page/UI restoration, pixel-level
+	modeOCR                 // D: text/conversation extraction
+)
+
+// modePriority labels for debug logging.
+var modeNames = map[visualMode]string{
+	modeDefault:  "DEFAULT",
+	modeErrorLog: "ERROR_LOG",
+	modeChart:    "CHART",
+	modeIssue:    "ISSUE",
+	modeUILayout: "UI_LAYOUT",
+	modeOCR:      "OCR",
+}
+
+// buildBriefPrompt builds a scene-aware prompt for the vision model.
+// It detects the most likely scene from focus+context signals and appends
+// specialized output instructions. Priority: error > chart > issue > UI > OCR > default.
 func buildBriefPrompt(input briefInput) string {
+	mode := detectVisualMode(input.Focus, input.Context)
+
 	var b strings.Builder
-	b.WriteString("Provide a first-round visual brief for the main agent.\n")
+	switch mode {
+	case modeErrorLog:
+		b.WriteString("You are analyzing an error/failure screenshot for a coding agent.\n")
+		b.WriteString("Extract ALL text EXACTLY — every line, every symbol, every error code.\n")
+		b.WriteString("Preserve stack trace hierarchy, line numbers, file paths, and exception types.\n")
+		b.WriteString("DO NOT paraphrase or summarize the error. The main agent needs the raw text.\n")
+	case modeChart:
+		b.WriteString("You are analyzing a chart/data visualization screenshot.\n")
+		b.WriteString("Extract: chart type, axis labels and ranges, data point values/trends, key metrics, anomalies.\n")
+		b.WriteString("Describe the data relationship clearly so the main agent can reason about it.\n")
+	case modeIssue:
+		b.WriteString("You are analyzing a screenshot with marked issues (red boxes, arrows, circles, highlights).\n")
+		b.WriteString("For each mark: describe its exact location, what element it points to, the apparent problem (misalignment, wrong color, overflow, etc.), and a specific fix suggestion.\n")
+	case modeUILayout:
+		b.WriteString("You are analyzing a UI/page/design screenshot for pixel-level restoration.\n")
+		b.WriteString("Describe: layout structure, element positions and sizes, color scheme, typography, spacing, interactive elements.\n")
+		b.WriteString("If possible, use ASCII to represent the element layout — this helps the main agent recreate the page precisely.\n")
+	case modeOCR:
+		b.WriteString("You are extracting all text from a document/conversation screenshot.\n")
+		b.WriteString("Output ALL text verbatim. Preserve speaker roles, text hierarchy (headings vs body vs captions), and content relationships.\n")
+	default:
+		b.WriteString("Provide a first-round visual brief for the main agent.\n")
+	}
+
 	if strings.TrimSpace(input.Context) != "" {
 		b.WriteString("\nTask context:\n")
 		b.WriteString(strings.TrimSpace(input.Context))
@@ -319,8 +371,83 @@ func buildBriefPrompt(input briefInput) string {
 		b.WriteString(strings.TrimSpace(input.Focus))
 		b.WriteByte('\n')
 	}
-	b.WriteString("\nReturn concise sections: overview, important visual details, any readable text/OCR, uncertainties, and useful Visual QA follow-ups. Do not solve beyond the visual evidence.")
+
+	// Common closing instruction (mode-specific additions already above).
+	switch mode {
+	case modeDefault:
+		b.WriteString("\nReturn concise sections: overview, important visual details, any readable text/OCR, uncertainties, and useful Visual QA follow-ups. Do not solve beyond the visual evidence.")
+	default:
+		b.WriteString("\nReturn your analysis concisely. Call out any uncertainty. Suggest what a follow-up Visual QA should ask for deeper detail.")
+	}
+
+	slog.Default().Debug("Visual brief mode selected", "mode", modeNames[mode])
 	return b.String()
+}
+
+// detectVisualMode determines the analysis mode from focus+context keywords.
+// Priority: error (C) > chart (E) > issue (B) > UI (A) > OCR (D) > default.
+// Signal words mirror the Observer plugin's design (Peng Qian, Data Leads Future).
+func detectVisualMode(focus, context string) visualMode {
+	combined := strings.ToLower(focus + " " + context)
+
+	// Mode C — Error Log Extraction (highest priority)
+	if hasAny(combined,
+		"error", "stack", "crash", "exception", "traceback",
+		"500", "404", "timeout", "panic", "fail",
+		"stack trace", "stacktrace",
+	) {
+		return modeErrorLog
+	}
+
+	// Mode E — Chart/Data Visualization
+	if hasAny(combined,
+		"chart", "line chart", "bar chart", "pie chart",
+		"scatter", "radar", "heatmap", "trend",
+		"data viz", "visualization", "data visualization",
+	) {
+		return modeChart
+	}
+
+	// Mode B — Issue Location and Fix
+	if hasAny(combined,
+		"fix", "issue", "bug", "adjust", "wrong",
+		"mark", "red box", "arrow", "circle",
+		"skewed", "misalign", "overlap", "overflow",
+		"redbox", "not align",
+	) {
+		return modeIssue
+	}
+
+	// Mode A — Page Restoration / UI Layout
+	if hasAny(combined,
+		"html", "page", "ui", "layout", "mockup", "design",
+		"frontend", "css", "pixel", "restore",
+		"reproduce", "recreate", "implement", "pixel-perfect",
+		"figma", "xd", "component",
+	) {
+		return modeUILayout
+	}
+
+	// Mode D — Text/Conversation Extraction (OCR)
+	if hasAny(combined,
+		"ocr", "extract text", "transcribe", "read text",
+		"conversation", "copywriting", "what was said",
+	) {
+		return modeOCR
+	}
+
+	return modeDefault
+}
+
+// hasAny returns true if the combined input contains any of the signal words.
+// Matches whole-word and word-boundary for shorter signals to avoid false positives.
+func hasAny(combined string, signals ...string) bool {
+	for _, s := range signals {
+		if strings.Contains(combined, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildQAPrompt(input qaInput) string {

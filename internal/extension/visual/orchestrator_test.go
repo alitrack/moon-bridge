@@ -430,3 +430,170 @@ func TestStripImagesFromAnthropic_MultiTurnDoesNotRestoreImages(t *testing.T) {
 	}
 }
 
+// ============================================================================
+// Scene detection tests
+// ============================================================================
+
+func TestDetectVisualMode_ErrorLog(t *testing.T) {
+	tests := []struct {
+		name    string
+		focus   string
+		context string
+	}{
+		{"stack trace", "", "here is a stack trace from my app"},
+		{"crash", "", "after the crash the server went down"},
+		{"error code", "", "500 internal server error"},
+		{"404 not found", "fix 404 error in screenshot", ""},
+		{"panic message", "debug panic", ""},
+		{"timeout", "request timeout screenshot", ""},
+		{"exception", "java exception", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectVisualMode(tt.focus, tt.context); got != modeErrorLog {
+				t.Errorf("detectVisualMode(%q, %q) = %v, want modeErrorLog", tt.focus, tt.context, got)
+			}
+		})
+	}
+}
+
+func TestDetectVisualMode_Chart(t *testing.T) {
+	tests := []struct {
+		name    string
+		focus   string
+		context string
+	}{
+		{"line chart", "analyze line chart", ""},
+		{"bar chart", "", "bar chart showing quarterly revenue"},
+		{"pie chart", "pie chart distribution", ""},
+		{"trend analysis", "", "review the trend data in this chart"},
+		{"visualization", "data visualization screenshot", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectVisualMode(tt.focus, tt.context); got != modeChart {
+				t.Errorf("detectVisualMode(%q, %q) = %v, want modeChart", tt.focus, tt.context, got)
+			}
+		})
+	}
+}
+
+func TestDetectVisualMode_Issue(t *testing.T) {
+	tests := []struct {
+		name    string
+		focus   string
+		context string
+	}{
+		{"red box mark", "the red box area needs fix", ""},
+		{"alignment issue", "", "elements are misaligned"},
+		{"overflow", "fix overflow bug", ""},
+		{"arrow pointing", "check what the arrow points to", ""},
+		{"fix wrong color", "", "wrong color in the marked area"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectVisualMode(tt.focus, tt.context); got != modeIssue {
+				t.Errorf("detectVisualMode(%q, %q) = %v, want modeIssue", tt.focus, tt.context, got)
+			}
+		})
+	}
+}
+
+func TestDetectVisualMode_UILayout(t *testing.T) {
+	tests := []struct {
+		name    string
+		focus   string
+		context string
+	}{
+		{"HTML page", "restore this HTML page from screenshot", ""},
+		{"UI mockup", "", "UI mockup design screenshot"},
+		{"Figma design", "figma design recreation", ""},
+		{"pixel perfect", "", "make pixel-perfect reproduction"},
+		{"CSS layout", "CSS layout from design", ""},
+		{"frontend component", "frontend component screenshot", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectVisualMode(tt.focus, tt.context); got != modeUILayout {
+				t.Errorf("detectVisualMode(%q, %q) = %v, want modeUILayout", tt.focus, tt.context, got)
+			}
+		})
+	}
+}
+
+func TestDetectVisualMode_OCR(t *testing.T) {
+	tests := []struct {
+		name    string
+		focus   string
+		context string
+	}{
+		{"extract text", "extract text from image", ""},
+		{"OCR", "", "OCR the document"},
+		{"transcribe", "transcribe conversation from image", ""},
+		{"read text", "read text from this document", ""},
+		{"copywriting", "", "copywriting content extraction"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectVisualMode(tt.focus, tt.context); got != modeOCR {
+				t.Errorf("detectVisualMode(%q, %q) = %v, want modeOCR", tt.focus, tt.context, got)
+			}
+		})
+	}
+}
+
+func TestDetectVisualMode_Default(t *testing.T) {
+	tests := []struct {
+		name    string
+		focus   string
+		context string
+	}{
+		{"empty", "", ""},
+		{"general question", "what is in this image", ""},
+		{"describe", "describe the image", ""},
+		{"unrelated terms", "something completely different", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectVisualMode(tt.focus, tt.context); got != modeDefault {
+				t.Errorf("detectVisualMode(%q, %q) = %v, want modeDefault", tt.focus, tt.context, got)
+			}
+		})
+	}
+}
+
+func TestDetectVisualMode_Priority(t *testing.T) {
+	// When multiple signals present, error has highest priority.
+	got := detectVisualMode("UI layout restore", "there is a crash error in the screenshot")
+	if got != modeErrorLog {
+		t.Errorf("expected highest priority modeErrorLog, got %v", got)
+	}
+
+	// Chart over issue
+	got = detectVisualMode("fix this bar chart", "")
+	if got != modeChart {
+		t.Errorf("expected modeChart (higher priority than issue), got %v", got)
+	}
+
+	// Issue over UI
+	got = detectVisualMode("red box on HTML page", "")
+	if got != modeIssue {
+		t.Errorf("expected modeIssue (higher priority than UI layout), got %v", got)
+	}
+}
+
+func TestHasAny(t *testing.T) {
+	if !hasAny("error stack trace", "error", "stack") {
+		t.Error("hasAny should find 'error' in 'error stack trace'")
+	}
+	if hasAny("hello world", "error", "fix") {
+		t.Error("hasAny should not find non-existent signals")
+	}
+	if !hasAny("chart analysis", "chart") {
+		t.Error("hasAny should find 'chart' in 'chart analysis'")
+	}
+	if hasAny("", "something") {
+		t.Error("hasAny on empty string should be false")
+	}
+}
+
