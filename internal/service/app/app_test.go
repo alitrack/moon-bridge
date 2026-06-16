@@ -3,10 +3,16 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"net"
+	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"moonbridge/internal/config"
+	"moonbridge/internal/service/configgraph"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/stats"
 	mbtrace "moonbridge/internal/service/trace"
@@ -34,6 +40,52 @@ func TestRunWritesWelcomeMessage(t *testing.T) {
 	want := "欢迎使用 Moon Bridge!\n"
 	if got := output.String(); got != want {
 		t.Fatalf("Run() wrote %q, want %q", got, want)
+	}
+}
+
+func TestRunServerSeedsEmptyConfigStoreBeforeServingConfigGraph(t *testing.T) {
+	addr := freeLoopbackAddr(t)
+	dbPath := filepath.Join(t.TempDir(), "moonbridge.db")
+	cfg := firstRunSQLiteConfig(t, addr, dbPath)
+	var output bytes.Buffer
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunServer(ctx, cfg, &output)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("RunServer() after cancel error = %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("RunServer() did not stop after cancel")
+		}
+	})
+
+	resp := waitForConfigGraph(t, "http://"+addr+"/api/v1/config/graph")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/v1/config/graph status = %d, want 200", resp.StatusCode)
+	}
+
+	var graph configgraph.Graph
+	if err := json.NewDecoder(resp.Body).Decode(&graph); err != nil {
+		t.Fatalf("decode config graph: %v", err)
+	}
+	if graph.Revision == "" {
+		t.Fatal("config graph revision is empty after first-run seed")
+	}
+	for _, want := range []string{
+		"Moon Bridge 监听于 " + addr,
+		"Web Console: http://" + addr + "/console/",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("RunServer output missing %q:\n%s", want, output.String())
+		}
 	}
 }
 
@@ -417,4 +469,89 @@ func TestBuildProviderDefsFromConfigKeepsMultiProviderDefinitions(t *testing.T) 
 	if defs["deepseek"].BaseURL != "https://deepseek.example.test" {
 		t.Fatalf("deepseek def = %+v", defs["deepseek"])
 	}
+}
+
+func freeLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen free loopback addr: %v", err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close free loopback listener: %v", err)
+	}
+	return addr
+}
+
+func firstRunSQLiteConfig(t *testing.T, addr string, dbPath string) config.Config {
+	t.Helper()
+	enabled := true
+	cfg, err := config.FromFileConfigWithOptions(config.FileConfig{
+		Mode: string(config.ModeTransform),
+		Server: config.ServerFileConfig{
+			Addr: addr,
+		},
+		Defaults: config.DefaultsFileConfig{
+			Model:     "moonbridge",
+			MaxTokens: 1024,
+		},
+		Models: map[string]config.ModelDefFileConfig{
+			"local-test-model": {
+				ContextWindow:   128000,
+				MaxOutputTokens: 4096,
+			},
+		},
+		Providers: map[string]config.ProviderDefFileConfig{
+			"local": {
+				BaseURL:  "https://api.example.invalid",
+				APIKey:   "test-key",
+				Protocol: config.ProtocolOpenAIChat,
+				Offers: []config.OfferFileConfig{
+					{
+						Model:        "local-test-model",
+						UpstreamName: "local-test-model",
+					},
+				},
+			},
+		},
+		Routes: map[string]config.RouteFileConfig{
+			"moonbridge": {
+				Provider: "local",
+				Model:    "local-test-model",
+			},
+		},
+		Persistence: config.PersistenceFileConfig{
+			ActiveProvider: "db_sqlite",
+		},
+		Extensions: map[string]config.ExtensionFileConfig{
+			"db_sqlite": {
+				Enabled: &enabled,
+				Config: map[string]any{
+					"path": dbPath,
+					"wal":  false,
+				},
+			},
+		},
+	}, config.LoadOptions{ExtensionSpecs: BuiltinExtensions().ConfigSpecs()})
+	if err != nil {
+		t.Fatalf("build first-run sqlite config: %v", err)
+	}
+	return cfg
+}
+
+func waitForConfigGraph(t *testing.T, url string) *http.Response {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err == nil {
+			return resp
+		}
+		lastErr = err
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("GET %s did not become available: %v", url, lastErr)
+	return nil
 }

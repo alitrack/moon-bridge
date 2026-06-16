@@ -51,6 +51,13 @@ func (rt *Runtime) Current() *ConfigSnapshot {
 	return rt.snapshot.Load()
 }
 
+func (rt *Runtime) ValidateCandidate(cfg config.Config) error {
+	if _, err := buildSnapshot(cfg, "runtime candidate"); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Reload validates the given config, builds a new ProviderManager, computes
 // pricing, and atomically replaces the snapshot. Returns an error if
 // validation or ProviderManager construction fails; the existing snapshot
@@ -59,31 +66,33 @@ func (rt *Runtime) Reload(cfg config.Config) error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
-	// Validate the new config.
+	snapshot, err := buildSnapshot(cfg, "runtime reload")
+	if err != nil {
+		return err
+	}
+	rt.snapshot.Store(snapshot)
+	return nil
+}
+
+func buildSnapshot(cfg config.Config, errorPrefix string) (*ConfigSnapshot, error) {
 	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("runtime reload: config validation: %w", err)
+		return nil, fmt.Errorf("%s: config validation: %w", errorPrefix, err)
 	}
 
-	// Build provider definitions and routes.
 	providerCfg := config.ProviderFromGlobalConfig(&cfg)
 	providerDefs := provider.BuildProviderDefsFromConfig(providerCfg)
 	modelRoutes := provider.BuildModelRoutesFromConfig(providerCfg)
 
-	// Build new provider manager.
 	providerMgr, err := provider.NewProviderManager(providerDefs, modelRoutes)
 	if err != nil {
-		return fmt.Errorf("runtime reload: provider manager: %w", err)
+		return nil, fmt.Errorf("%s: provider manager: %w", errorPrefix, err)
 	}
 
-	// Compute pricing from the new config.
 	pricing := provider.BuildPricingFromConfig(providerCfg)
 
-	// Create and atomically store the new snapshot.
-	snapshot := &ConfigSnapshot{
+	return &ConfigSnapshot{
 		Config:      cfg,
 		ProviderMgr: providerMgr,
 		Pricing:     pricing,
-	}
-	rt.snapshot.Store(snapshot)
-	return nil
+	}, nil
 }

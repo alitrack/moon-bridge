@@ -100,31 +100,16 @@ trace:
 	}
 }
 
-func TestXDGDefaultConfigPathUsesXDGConfigHome(t *testing.T) {
-	configHome := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configHome)
-	t.Setenv("HOME", filepath.Join(t.TempDir(), "home"))
+func TestXDGDefaultConfigPathUsesHomeMoonbridgeDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "xdg"))
 
 	got, err := config.XDGDefaultConfigPath()
 	if err != nil {
 		t.Fatalf("XDGDefaultConfigPath() error = %v", err)
 	}
-	want := filepath.Join(configHome, "moonbridge", "config.yml")
-	if got != want {
-		t.Fatalf("XDGDefaultConfigPath() = %q, want %q", got, want)
-	}
-}
-
-func TestXDGDefaultConfigPathFallsBackToHome(t *testing.T) {
-	configHome := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", "")
-	t.Setenv("HOME", configHome)
-
-	got, err := config.XDGDefaultConfigPath()
-	if err != nil {
-		t.Fatalf("XDGDefaultConfigPath() error = %v", err)
-	}
-	want := filepath.Join(configHome, ".config", "moonbridge", "config.yml")
+	want := filepath.Join(home, "moonbridge", "config.yml")
 	if got != want {
 		t.Fatalf("XDGDefaultConfigPath() = %q, want %q", got, want)
 	}
@@ -600,6 +585,18 @@ routes:
 	if route.Description != "A test model" {
 		t.Fatalf("Description = %q, want \"A test model\"", route.Description)
 	}
+	if !cfg.Models["claude-test"].SupportsReasoning {
+		t.Fatal("Models[claude-test].SupportsReasoning = false, want true")
+	}
+	if !cfg.ProviderDefs["main"].Models["claude-test"].SupportsReasoning {
+		t.Fatal("ProviderDefs[main].Models[claude-test].SupportsReasoning = false, want true")
+	}
+	if !route.SupportsReasoning {
+		t.Fatal("RouteFor(gpt-test).SupportsReasoning = false, want true")
+	}
+	if !cfg.RouteFor("main/claude-test").SupportsReasoning {
+		t.Fatal("RouteFor(main/claude-test).SupportsReasoning = false, want true")
+	}
 	if route.DefaultReasoningLevel != "medium" {
 		t.Fatalf("DefaultReasoningLevel = %q", route.DefaultReasoningLevel)
 	}
@@ -614,6 +611,76 @@ routes:
 	}
 	if route.DefaultReasoningSummary != "auto" {
 		t.Fatalf("DefaultReasoningSummary = %q", route.DefaultReasoningSummary)
+	}
+}
+
+func TestLoadFromYAMLInfersReasoningSupportFromSummaryMetadata(t *testing.T) {
+	cfg, err := config.LoadFromYAML([]byte(`
+mode: Transform
+models:
+  claude-test:
+    supports_reasoning_summaries: true
+    default_reasoning_summary: "auto"
+providers:
+  main:
+    base_url: https://provider.example.test
+    api_key: upstream-key
+    offers:
+      - model: claude-test
+routes:
+  gpt-test:
+    model: claude-test
+    provider: main
+`))
+	if err != nil {
+		t.Fatalf("LoadFromYAML() error = %v", err)
+	}
+	if !cfg.Models["claude-test"].SupportsReasoning {
+		t.Fatal("Models[claude-test].SupportsReasoning = false, want true")
+	}
+	if !cfg.RouteFor("gpt-test").SupportsReasoning {
+		t.Fatal("RouteFor(gpt-test).SupportsReasoning = false, want true")
+	}
+}
+
+func TestLoadFromYAMLProviderOfferOverrideCanDisableReasoningSupport(t *testing.T) {
+	cfg, err := config.LoadFromYAML([]byte(`
+mode: Transform
+models:
+  claude-test:
+    default_reasoning_level: "medium"
+    supported_reasoning_levels:
+      - effort: "medium"
+        description: "Balanced"
+providers:
+  main:
+    base_url: https://provider.example.test
+    api_key: upstream-key
+    offers:
+      - model: claude-test
+        upstream_name: claude-test-plain
+        overrides:
+          supports_reasoning: false
+routes:
+  gpt-test:
+    model: claude-test
+    provider: main
+`))
+	if err != nil {
+		t.Fatalf("LoadFromYAML() error = %v", err)
+	}
+	if !cfg.Models["claude-test"].SupportsReasoning {
+		t.Fatal("Models[claude-test].SupportsReasoning = false, want true")
+	}
+	meta := cfg.ProviderDefs["main"].Models["claude-test-plain"]
+	if meta.SupportsReasoning {
+		t.Fatal("ProviderDefs[main].Models[claude-test-plain].SupportsReasoning = true, want false from offer override")
+	}
+	if cfg.RouteFor("main/claude-test-plain").SupportsReasoning {
+		t.Fatal("RouteFor(main/claude-test-plain).SupportsReasoning = true, want false from offer override")
+	}
+	if cfg.RouteFor("gpt-test").SupportsReasoning {
+		t.Fatal("RouteFor(gpt-test).SupportsReasoning = true, want false from offer override")
 	}
 }
 

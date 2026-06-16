@@ -79,6 +79,44 @@ func (p *Plugin) EnabledForModel(string) bool {
 	return p.metricsStore != nil
 }
 
+// --- UsageSource ---
+
+// AggregateUsage aggregates persisted request metrics for the given window so
+// the console can show cross-session usage analytics. Returns an empty
+// aggregate (no error) when persistence is unavailable.
+func (p *Plugin) AggregateUsage(query plugin.UsageQuery) (plugin.UsageAggregate, error) {
+	if p.metricsStore == nil {
+		return plugin.UsageAggregate{}, nil
+	}
+	agg, err := p.metricsStore.AggregateUsage(query.Since, query.Until)
+	if err != nil {
+		return plugin.UsageAggregate{}, err
+	}
+	out := plugin.UsageAggregate{
+		Requests:      agg.Requests,
+		InputTokens:   agg.InputTokens,
+		OutputTokens:  agg.OutputTokens,
+		CacheCreation: agg.CacheCreation,
+		CacheRead:     agg.CacheRead,
+		Cost:          agg.Cost,
+		Earliest:      agg.Earliest,
+		Latest:        agg.Latest,
+	}
+	for _, m := range agg.ByModel {
+		out.ByModel = append(out.ByModel, plugin.UsageModelAggregate{
+			Model:         m.Model,
+			ActualModel:   m.ActualModel,
+			Requests:      m.Requests,
+			InputTokens:   m.InputTokens,
+			OutputTokens:  m.OutputTokens,
+			CacheCreation: m.CacheCreation,
+			CacheRead:     m.CacheRead,
+			Cost:          m.Cost,
+		})
+	}
+	return out, nil
+}
+
 // --- DBConsumer ---
 
 func (p *Plugin) DBConsumer() db.Consumer {

@@ -8,11 +8,19 @@ __pycache__/
 
 # Agent / AI assistant local files
 .planning/
+.superpowers/
+.worktrees/
+docs/superpowers/
 helloagents/
 AGENTS.md
 CLAUDE.md
-.codex
 .codex/
+!.codex/
+.codex/*
+!.codex/skills/
+.codex/skills/*
+!.codex/skills/moonbridge-webui-design/
+!.codex/skills/moonbridge-webui-design/**
 .claude
 .claude/
 .agents
@@ -51,9 +59,19 @@ node_modules/
 build/
 .wrangler/
 # WebUI build artifacts (source in webui/)
+webui/node_modules
+webui/node_modules/
+webui/dist/
+webui/coverage/
+webui/.vite/
+webui/.vitest/
+webui/*.tsbuildinfo
+webui/test-results/
+webui/playwright-report/
 
 # Wrangler dev vars
 .dev.vars
 /moonbridge
+/logs/
 logs/
 *.log

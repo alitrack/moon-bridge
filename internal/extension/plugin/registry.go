@@ -32,6 +32,7 @@ type Registry struct {
 	dbProviders            []DBProvider
 	dbConsumers            []DBConsumer
 	requestCompletionHooks []RequestCompletionHook
+	usageSources           []UsageSource
 	routeRegistrars        []RouteRegistrar
 	configSpecs            []config.ExtensionConfigSpec
 	logger                 *slog.Logger
@@ -112,9 +113,21 @@ func (r *Registry) Register(p Plugin) {
 	if v, ok := p.(RequestCompletionHook); ok {
 		r.requestCompletionHooks = append(r.requestCompletionHooks, v)
 	}
+	if v, ok := p.(UsageSource); ok {
+		r.usageSources = append(r.usageSources, v)
+	}
 	if v, ok := p.(RouteRegistrar); ok {
 		r.routeRegistrars = append(r.routeRegistrars, v)
 	}
+}
+
+// UsageSource returns the first registered cross-session usage-analytics
+// source, or nil if no plugin persists per-request usage.
+func (r *Registry) UsageSource() UsageSource {
+	if r == nil || len(r.usageSources) == 0 {
+		return nil
+	}
+	return r.usageSources[0]
 }
 
 func (r *Registry) ConfigSpecs() []config.ExtensionConfigSpec {

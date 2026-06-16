@@ -17,7 +17,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 
 	"moonbridge/internal/config"
 	"moonbridge/internal/db"
@@ -46,11 +48,11 @@ func (p *sqliteProvider) Name() string { return PluginName }
 func (p *sqliteProvider) Dialect() db.Dialect { return db.DialectSQLite }
 
 func (p *sqliteProvider) Open(ctx context.Context) error {
-	absPath, err := filepath.Abs(p.cfg.Path)
+	dsn, err := sqliteDSN(p.cfg.Path)
 	if err != nil {
-		return fmt.Errorf("resolve path: %w", err)
+		return err
 	}
-	d, err := sql.Open("sqlite", absPath)
+	d, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("sql open: %w", err)
 	}
@@ -78,6 +80,31 @@ func (p *sqliteProvider) Open(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func sqliteDSN(path string) (string, error) {
+	if isSQLiteMemoryPath(path) {
+		return path, nil
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve path: %w", err)
+	}
+	parent := filepath.Dir(absPath)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return "", fmt.Errorf("create sqlite parent directory %s: %w", parent, err)
+	}
+	return absPath, nil
+}
+
+func isSQLiteMemoryPath(path string) bool {
+	if path == ":memory:" {
+		return true
+	}
+	if strings.HasPrefix(path, "file:") && strings.Contains(path, "mode=memory") {
+		return true
+	}
+	return path == "file::memory:"
 }
 
 func (p *sqliteProvider) DB() *sql.DB { return p.db }

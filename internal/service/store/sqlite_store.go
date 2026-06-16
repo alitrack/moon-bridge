@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +24,8 @@ type SQLiteConfigStore struct {
 	applyMu        sync.Mutex
 	extensionSpecs []config.ExtensionConfigSpec
 }
+
+const graphRevisionSettingKey = "__graph_revision"
 
 // NewSQLiteStore creates a new SQLiteConfigStore.
 func NewSQLiteStore(s db.Store, logger *slog.Logger, extensionSpecs ...config.ExtensionConfigSpec) *SQLiteConfigStore {
@@ -51,93 +55,195 @@ func nowStr() string {
 // Clears existing data then writes settings, models, providers+offers, and routes.
 func (s *SQLiteConfigStore) SeedFromConfig(cfg *config.Config) error {
 	fc := cfg.ToFileConfig()
-	ts := nowStr()
-
 	return s.db.WithTx(context.Background(), func(tx db.Tx) error {
-		providersTable, _ := tx.Table("providers")
-		offersTable, _ := tx.Table("offers")
-		modelsTable, _ := tx.Table("models")
-		routesTable, _ := tx.Table("routes")
-		settingsTable, _ := tx.Table("settings")
-
-		// Clear all tables.
-		for _, tbl := range []string{providersTable, offersTable, modelsTable, routesTable, settingsTable} {
-			if _, err := tx.ExecContext(context.Background(), "DELETE FROM "+tbl); err != nil {
-				return fmt.Errorf("clear %s: %w", tbl, err)
-			}
+		revision, err := nextRevisionTx(context.Background(), tx)
+		if err != nil {
+			return err
 		}
-
-		// Settings.
-		settings := buildSettings(fc)
-		for key, value := range settings {
-			if _, err := tx.ExecContext(context.Background(),
-				"INSERT OR REPLACE INTO "+settingsTable+" (key, value) VALUES (?, ?)", key, value); err != nil {
-				return fmt.Errorf("insert setting %s: %w", key, err)
-			}
-		}
-
-		// Models.
-		for slug, m := range fc.Models {
-			metaJSON, err := json.Marshal(m)
-			if err != nil {
-				return fmt.Errorf("marshal model %s: %w", slug, err)
-			}
-			if _, err := tx.ExecContext(context.Background(),
-				"INSERT OR REPLACE INTO "+modelsTable+" (slug, metadata, created_at, updated_at) VALUES (?, ?, ?, ?)",
-				slug, string(metaJSON), ts, ts); err != nil {
-				return fmt.Errorf("insert model %s: %w", slug, err)
-			}
-		}
-
-		// Providers + Offers.
-		for key, p := range fc.Providers {
-			wsJSON, _ := json.Marshal(p.WebSearch)
-			extJSON, _ := json.Marshal(p.Extensions)
-
-			if _, err := tx.ExecContext(context.Background(),
-				"INSERT OR REPLACE INTO "+providersTable+
-					" (key, base_url, api_key, version, protocol, enabled, user_agent, web_search, extensions, created_at, updated_at)"+
-					" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-				key, p.BaseURL, p.APIKey, p.Version, p.Protocol, 1, p.UserAgent,
-				string(wsJSON), string(extJSON), ts, ts); err != nil {
-				return fmt.Errorf("insert provider %s: %w", key, err)
-			}
-
-			for _, offer := range p.Offers {
-				var overridesJSON string
-				if offer.Overrides != nil {
-					b, _ := json.Marshal(*offer.Overrides)
-					overridesJSON = string(b)
-				}
-				if _, err := tx.ExecContext(context.Background(),
-					"INSERT OR REPLACE INTO "+offersTable+
-						" (provider_key, model_slug, upstream_name, priority, input_price, output_price, cache_write, cache_read, overrides)"+
-						" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-					key, offer.Model, offer.UpstreamName, offer.Priority,
-					offer.Pricing.InputPrice, offer.Pricing.OutputPrice,
-					offer.Pricing.CacheWritePrice, offer.Pricing.CacheReadPrice,
-					overridesJSON); err != nil {
-					return fmt.Errorf("insert offer %s/%s: %w", key, offer.Model, err)
-				}
-			}
-		}
-
-		// Routes.
-		for alias, r := range fc.Routes {
-			extJSON, _ := json.Marshal(r.Extensions)
-			wsJSON, _ := json.Marshal(r.WebSearch)
-			if _, err := tx.ExecContext(context.Background(),
-				"INSERT OR REPLACE INTO "+routesTable+
-					" (alias, model_slug, provider_key, display_name, context_window, max_output_tokens, extensions, web_search, created_at, updated_at)"+
-					" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-				alias, r.Model, r.Provider, r.DisplayName, r.ContextWindow, 0,
-				string(extJSON), string(wsJSON), ts, ts); err != nil {
-				return fmt.Errorf("insert route %s: %w", alias, err)
-			}
-		}
-
-		return nil
+		return replaceConfigTx(context.Background(), tx, fc, revision)
 	})
+}
+
+func (s *SQLiteConfigStore) SaveConfig(ctx context.Context, cfg *config.Config) (string, error) {
+	if cfg == nil {
+		return "", errors.New("save config: config is nil")
+	}
+	if err := cfg.Validate(); err != nil {
+		return "", fmt.Errorf("save config: validate: %w", err)
+	}
+	fc := cfg.ToFileConfig()
+
+	var revision string
+	if err := s.db.WithTx(ctx, func(tx db.Tx) error {
+		next, err := nextRevisionTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if err := replaceConfigTx(ctx, tx, fc, next); err != nil {
+			return err
+		}
+		revision = next
+		return nil
+	}); err != nil {
+		return "", fmt.Errorf("save config: %w", err)
+	}
+	return revision, nil
+}
+
+func (s *SQLiteConfigStore) CurrentRevision() (string, error) {
+	settingsTable := s.table("settings")
+	var revision string
+	if err := s.db.QueryRowContext(context.Background(),
+		"SELECT value FROM "+settingsTable+" WHERE key = ?", graphRevisionSettingKey).Scan(&revision); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", errors.New("current revision: graph revision is not initialized")
+		}
+		return "", fmt.Errorf("current revision: %w", err)
+	}
+	if revision == "" {
+		return "", errors.New("current revision: graph revision is empty")
+	}
+	return revision, nil
+}
+
+func replaceConfigTx(ctx context.Context, tx db.Tx, fc config.FileConfig, revision string) error {
+	ts := nowStr()
+	providersTable, err := tx.Table("providers")
+	if err != nil {
+		return err
+	}
+	offersTable, err := tx.Table("offers")
+	if err != nil {
+		return err
+	}
+	modelsTable, err := tx.Table("models")
+	if err != nil {
+		return err
+	}
+	routesTable, err := tx.Table("routes")
+	if err != nil {
+		return err
+	}
+	settingsTable, err := tx.Table("settings")
+	if err != nil {
+		return err
+	}
+
+	for _, tbl := range []string{providersTable, offersTable, modelsTable, routesTable, settingsTable} {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM "+tbl); err != nil {
+			return fmt.Errorf("clear %s: %w", tbl, err)
+		}
+	}
+
+	settings := buildSettings(fc)
+	settings[graphRevisionSettingKey] = revision
+	for key, value := range settings {
+		if _, err := tx.ExecContext(ctx,
+			"INSERT OR REPLACE INTO "+settingsTable+" (key, value) VALUES (?, ?)", key, value); err != nil {
+			return fmt.Errorf("insert setting %s: %w", key, err)
+		}
+	}
+
+	for slug, m := range fc.Models {
+		metaJSON, err := json.Marshal(m)
+		if err != nil {
+			return fmt.Errorf("marshal model %s: %w", slug, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			"INSERT OR REPLACE INTO "+modelsTable+" (slug, metadata, created_at, updated_at) VALUES (?, ?, ?, ?)",
+			slug, string(metaJSON), ts, ts); err != nil {
+			return fmt.Errorf("insert model %s: %w", slug, err)
+		}
+	}
+
+	for key, p := range fc.Providers {
+		wsJSON, err := json.Marshal(p.WebSearch)
+		if err != nil {
+			return fmt.Errorf("marshal provider %s web_search: %w", key, err)
+		}
+		extJSON, err := json.Marshal(p.Extensions)
+		if err != nil {
+			return fmt.Errorf("marshal provider %s extensions: %w", key, err)
+		}
+
+		if _, err := tx.ExecContext(ctx,
+			"INSERT OR REPLACE INTO "+providersTable+
+				" (key, base_url, api_key, version, protocol, enabled, user_agent, web_search, extensions, created_at, updated_at)"+
+				" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			key, p.BaseURL, p.APIKey, p.Version, p.Protocol, 1, p.UserAgent,
+			string(wsJSON), string(extJSON), ts, ts); err != nil {
+			return fmt.Errorf("insert provider %s: %w", key, err)
+		}
+
+		for _, offer := range p.Offers {
+			var overridesJSON string
+			if offer.Overrides != nil {
+				b, err := json.Marshal(*offer.Overrides)
+				if err != nil {
+					return fmt.Errorf("marshal offer %s/%s overrides: %w", key, offer.Model, err)
+				}
+				overridesJSON = string(b)
+			}
+			if _, err := tx.ExecContext(ctx,
+				"INSERT OR REPLACE INTO "+offersTable+
+					" (provider_key, model_slug, upstream_name, priority, input_price, output_price, cache_write, cache_read, overrides)"+
+					" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				key, offer.Model, offer.UpstreamName, offer.Priority,
+				offer.Pricing.InputPrice, offer.Pricing.OutputPrice,
+				offer.Pricing.CacheWritePrice, offer.Pricing.CacheReadPrice,
+				overridesJSON); err != nil {
+				return fmt.Errorf("insert offer %s/%s: %w", key, offer.Model, err)
+			}
+		}
+	}
+
+	for alias, r := range fc.Routes {
+		extJSON, err := json.Marshal(r.Extensions)
+		if err != nil {
+			return fmt.Errorf("marshal route %s extensions: %w", alias, err)
+		}
+		wsJSON, err := json.Marshal(r.WebSearch)
+		if err != nil {
+			return fmt.Errorf("marshal route %s web_search: %w", alias, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			"INSERT OR REPLACE INTO "+routesTable+
+				" (alias, model_slug, provider_key, display_name, context_window, max_output_tokens, extensions, web_search, created_at, updated_at)"+
+				" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			alias, r.Model, r.Provider, r.DisplayName, r.ContextWindow, 0,
+			string(extJSON), string(wsJSON), ts, ts); err != nil {
+			return fmt.Errorf("insert route %s: %w", alias, err)
+		}
+	}
+
+	return nil
+}
+
+func nextRevisionTx(ctx context.Context, tx db.Tx) (string, error) {
+	settingsTable, err := tx.Table("settings")
+	if err != nil {
+		return "", err
+	}
+	var current string
+	err = tx.QueryRowContext(ctx, "SELECT value FROM "+settingsTable+" WHERE key = ?", graphRevisionSettingKey).Scan(&current)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("read current revision: %w", err)
+	}
+
+	next := time.Now().UTC().UnixNano()
+	if current != "" {
+		currentValue, err := strconv.ParseInt(current, 10, 64)
+		if err != nil {
+			return "", fmt.Errorf("parse current revision %q: %w", current, err)
+		}
+		if currentValue == math.MaxInt64 {
+			return "", errors.New("current revision has reached max int64")
+		}
+		if next <= currentValue {
+			next = currentValue + 1
+		}
+	}
+	return strconv.FormatInt(next, 10), nil
 }
 
 // toModelDefFileConfig converts a ModelDef to ModelDefFileConfig for storage.
@@ -160,6 +266,7 @@ func toModelDefFileConfig(def config.ModelDef) config.ModelDefFileConfig {
 		DefaultReasoningSummary:  def.DefaultReasoningSummary,
 		InputModalities:          def.InputModalities,
 	}
+	m.SupportsReasoning = boolPtr(def.SupportsReasoning)
 	if def.SupportsReasoningSummaries {
 		m.SupportsReasoningSummaries = boolPtr(true)
 	}
@@ -241,7 +348,7 @@ func (s *SQLiteConfigStore) LoadAll() (*config.Config, error) {
 		return nil, fmt.Errorf("load file config: %w", err)
 	}
 	if fc.Mode == "" {
-		return nil, fmt.Errorf("config not seeded: mode is empty")
+		return nil, fmt.Errorf("%w: mode is empty", ErrConfigNotSeeded)
 	}
 	cfg, err := config.FromFileConfigWithOptions(fc, config.LoadOptions{ExtensionSpecs: s.extensionSpecs})
 	if err != nil {

@@ -21,6 +21,7 @@ import (
 	"moonbridge/internal/service/runtime"
 	"moonbridge/internal/service/stats"
 	"moonbridge/internal/service/store"
+	"moonbridge/internal/service/webui"
 
 	"moonbridge/internal/service/server/session"
 	"moonbridge/internal/service/server/trace"
@@ -186,6 +187,7 @@ func New(cfg Config) *Server {
 	s.mux.HandleFunc("/responses", s.handleResponses)
 	s.mux.HandleFunc("/v1/models", s.handleModels)
 	s.mux.HandleFunc("/models", s.handleModels)
+	s.mux.Handle("/console/", webui.Embedded())
 	s.registerPluginRoutes()
 	if cfg.Runtime != nil && cfg.Store != nil {
 		apiRouter := api.NewRouter(s.store, s.runtime, s.stats, s.pluginRegistry, s)
@@ -195,7 +197,7 @@ func New(cfg Config) *Server {
 }
 
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	if token := s.currentConfig().AuthToken; token != "" {
+	if token := s.currentConfig().AuthToken; token != "" && !isConsoleAssetPath(request.URL.Path) {
 		if !checkAuth(request, token) {
 			writer.Header().Set("Content-Type", "application/json")
 			writer.WriteHeader(http.StatusUnauthorized)
@@ -208,6 +210,10 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 	}
 	s.mux.ServeHTTP(writer, request)
+}
+
+func isConsoleAssetPath(path string) bool {
+	return path == "/console" || strings.HasPrefix(path, "/console/")
 }
 
 func (s *Server) handleModels(writer http.ResponseWriter, request *http.Request) {

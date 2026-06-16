@@ -196,6 +196,48 @@ type DBConsumer interface {
 	DBConsumer() foundationdb.Consumer
 }
 
+// --- Usage analytics capabilities ---
+
+// UsageQuery selects a time window of persisted per-request usage. A zero
+// Since means "from the earliest record"; a zero Until means "up to now".
+type UsageQuery struct {
+	Since time.Time
+	Until time.Time
+}
+
+// UsageModelAggregate holds aggregated usage for a single model.
+type UsageModelAggregate struct {
+	Model         string
+	ActualModel   string
+	Requests      int64
+	InputTokens   int64
+	OutputTokens  int64
+	CacheCreation int64
+	CacheRead     int64
+	Cost          float64
+}
+
+// UsageAggregate holds aggregated usage totals plus a per-model breakdown for a
+// queried time window, sourced from persisted (cross-session) metrics.
+type UsageAggregate struct {
+	Requests      int64
+	InputTokens   int64
+	OutputTokens  int64
+	CacheCreation int64
+	CacheRead     int64
+	Cost          float64
+	Earliest      time.Time
+	Latest        time.Time
+	ByModel       []UsageModelAggregate
+}
+
+// UsageSource is implemented by plugins that persist per-request usage and can
+// aggregate it over a time window. This powers cross-session usage analytics in
+// the console overview, independent of the in-memory per-process session stats.
+type UsageSource interface {
+	AggregateUsage(query UsageQuery) (UsageAggregate, error)
+}
+
 // --- Core format capabilities (Adapter path) ---
 
 // CoreRequestMutator defines a plugin that can modify a CoreRequest.

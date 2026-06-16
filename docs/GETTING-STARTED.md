@@ -22,21 +22,29 @@ cd moon-bridge
 go build -o moonbridge ./cmd/moonbridge
 ```
 
-或直接运行：
+pacman 或二进制安装后可以直接运行：
 
 ```bash
-go run ./cmd/moonbridge -config config.yml
+moonbridge
+```
+
+源码开发也可以直接运行：
+
+```bash
+go run ./cmd/moonbridge
 ```
 
 ## 2. 配置
 
-复制示例配置并编辑：
+未传 `-config` 且 `$HOME/moonbridge/config.yml` 不存在时，Moon Bridge 会自动创建 starter 配置，启用 SQLite，并把数据库放在 `$HOME/moonbridge/data/moonbridge.db`。启动后打开 Web Console：
 
-```bash
-cp config.example.yml config.yml
+```text
+http://127.0.0.1:38440/console/
 ```
 
-详细配置说明见 [CONFIGURATION.md](CONFIGURATION.md)。
+真实请求前，需要在 Web Console 中替换 starter 配置里的占位 Provider、Model 和 API Key。仍需要准备一个上游 LLM Provider 的 API Key（如 DeepSeek、OpenAI、Anthropic、Kimi 等）。
+
+如需手动维护 YAML，可参考 `config.example.yml`。详细配置说明见 [CONFIGURATION.md](CONFIGURATION.md)。
 
 ### 最小配置示例（以 DeepSeek 为例）
 
@@ -79,12 +87,14 @@ routes:
 ## 3. 启动
 
 ```bash
-go run ./cmd/moonbridge -config config.yml
+moonbridge
 ```
 
 日志输出：
 
 ```
+Moon Bridge 监听于 127.0.0.1:38440
+Web Console: http://127.0.0.1:38440/console/
 INFO HTTP 服务器监听中 addr=127.0.0.1:38440
 ```
 

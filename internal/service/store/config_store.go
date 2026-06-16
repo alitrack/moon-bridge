@@ -5,9 +5,14 @@ package store
 
 import (
 	"context"
+	"errors"
 
 	"moonbridge/internal/config"
 )
+
+// ErrConfigNotSeeded reports an empty persistence store that has tables but no
+// persisted graph configuration yet.
+var ErrConfigNotSeeded = errors.New("config not seeded")
 
 // ReloadFunc is called by ApplyPendingChanges to apply a new configuration
 // after successful staging validation.
@@ -35,6 +40,12 @@ type ConfigStore interface {
 	// SeedFromConfig populates the main tables from a config.Config.
 	// Intended for first-time DB initialization.
 	SeedFromConfig(cfg *config.Config) error
+
+	// SaveConfig atomically replaces the persisted graph configuration.
+	SaveConfig(ctx context.Context, cfg *config.Config) (string, error)
+
+	// CurrentRevision returns the current persisted graph revision.
+	CurrentRevision() (string, error)
 
 	// ExportYAML serializes the current DB state as YAML bytes.
 	// If includeSecrets is false, API key values are masked.

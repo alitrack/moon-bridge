@@ -48,6 +48,7 @@ type WebSearchConfig struct {
 	TavilyAPIKey    string
 	FirecrawlAPIKey string
 	SearchMaxRounds int
+	Extra           map[string]any
 }
 
 type Config struct {
@@ -64,6 +65,7 @@ type Config struct {
 	TavilyAPIKey     string
 	FirecrawlAPIKey  string
 	SearchMaxRounds  int
+	WebSearchExtra   map[string]any
 	DefaultMaxTokens int
 	MaxSessions      int    `yaml:"max_sessions"` // 0 = unlimited
 	SessionTTL       string `yaml:"session_ttl"`  // default "24h"
@@ -98,6 +100,7 @@ type RouteEntry struct {
 	Description string
 	// BaseInstructions overrides the default model instructions for the catalog.
 	BaseInstructions           string
+	SupportsReasoning          bool
 	DefaultReasoningLevel      string
 	SupportedReasoningLevels   []ReasoningLevelPreset
 	SupportsReasoningSummaries bool
@@ -135,6 +138,7 @@ type ProviderDef struct {
 	TavilyAPIKey     string
 	FirecrawlAPIKey  string
 	SearchMaxRounds  int
+	WebSearchExtra   map[string]any
 	Extensions       map[string]ExtensionSettings
 	// Models is the provider's model catalog: upstream model name -> metadata.
 	Models map[string]ModelMeta
@@ -155,6 +159,7 @@ type ModelMeta struct {
 	Description string
 	// BaseInstructions overrides the default model instructions for the catalog.
 	BaseInstructions           string
+	SupportsReasoning          bool
 	DefaultReasoningLevel      string
 	SupportedReasoningLevels   []ReasoningLevelPreset
 	SupportsReasoningSummaries bool
@@ -192,6 +197,7 @@ type ModelDef struct {
 	DisplayName                 string
 	Description                 string
 	BaseInstructions            string
+	SupportsReasoning           bool
 	DefaultReasoningLevel       string
 	SupportedReasoningLevels    []ReasoningLevelPreset
 	SupportsReasoningSummaries  bool
@@ -413,6 +419,7 @@ func (cfg Config) RouteFor(model string) RouteEntry {
 				entry.CacheReadPrice = meta.CacheReadPrice
 				entry.DisplayName = meta.DisplayName
 				entry.Description = meta.Description
+				entry.SupportsReasoning = meta.SupportsReasoning
 				entry.DefaultReasoningLevel = meta.DefaultReasoningLevel
 				entry.SupportedReasoningLevels = meta.SupportedReasoningLevels
 				entry.SupportsReasoningSummaries = meta.SupportsReasoningSummaries

@@ -2,11 +2,11 @@ package app
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"log/slog"
@@ -118,7 +118,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 	defer plugins.ShutdownAll()
 
 	// Wire plugin LogConsumer into the slog consume pipeline.
-	logger.SetConsumeFunc(func(entries []logger.LogEntry) []logger.LogEntry {
+	logger.AddConsumeFunc(func(entries []logger.LogEntry) []logger.LogEntry {
 		return plugins.ConsumeGlobalLog(entries)
 	})
 
@@ -183,8 +183,11 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 				}
 			}
 		} else if loadErr != nil {
-			if strings.Contains(loadErr.Error(), "config not seeded") {
-				logger.Info("persistence store is empty, skipping DB config load")
+			if stderrors.Is(loadErr, store.ErrConfigNotSeeded) {
+				logger.Info("持久化存储为空，从 YAML 导入种子配置")
+				if err := cs.SeedFromConfig(&cfg); err != nil {
+					return fmt.Errorf("seed config store from YAML: %w", err)
+				}
 			} else {
 				logger.Warn("config store 加载失败", "error", loadErr)
 			}
@@ -283,6 +286,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 		PluginRegistry:  plugins,
 		AppConfig:       serverCfg,
 		Runtime:         rt,
+		Store:           cs,
 		AdapterRegistry: adapterReg,
 		SessionManager:  sessMgr,
 		UsageTracker:    usageTrk,
@@ -634,7 +638,9 @@ func runHTTPServer(ctx context.Context, addr string, handler http.Handler, error
 	errCh := make(chan error, 1)
 	go func() {
 		fmt.Fprintf(errors, "%s 监听于 %s\n", Name, addr)
-		slog.Info("HTTP 服务器监听中", "addr", addr)
+		consoleURL := fmt.Sprintf("http://%s/console/", addr)
+		fmt.Fprintf(errors, "Web Console: %s\n", consoleURL)
+		slog.Info("HTTP 服务器监听中", "addr", addr, "webui", consoleURL)
 		errCh <- httpServer.ListenAndServe()
 	}()
 

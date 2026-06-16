@@ -2,6 +2,8 @@ package dbsqlite_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"moonbridge/internal/config"
@@ -73,6 +75,34 @@ func TestOpenAndClose(t *testing.T) {
 	}
 	if feat.WorkerBound {
 		t.Fatal("Features().WorkerBound should be false")
+	}
+}
+
+func TestOpenCreatesParentDirectories(t *testing.T) {
+	p := dbsqlite.NewPlugin()
+	wal := false
+	dir := filepath.Join(t.TempDir(), "nested", "data")
+	dbPath := filepath.Join(dir, "moonbridge.db")
+	cfg := &dbsqlite.Config{
+		Path: dbPath,
+		WAL:  &wal,
+	}
+	ctx := plugin.PluginContext{Config: cfg, AppConfig: config.Config{}}
+	if err := p.Init(ctx); err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	prov := p.DBProvider()
+	if prov == nil {
+		t.Fatal("DBProvider() should not be nil")
+	}
+
+	if err := prov.Open(context.Background()); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer prov.Close()
+
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("stat db path after Open(): %v", err)
 	}
 }
 

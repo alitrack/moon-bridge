@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -111,6 +112,7 @@ type ModelDefFileConfig struct {
 	DisplayName                 string                           `yaml:"display_name,omitempty" json:"display_name,omitempty"`
 	Description                 string                           `yaml:"description,omitempty" json:"description,omitempty"`
 	BaseInstructions            string                           `yaml:"base_instructions,omitempty" json:"base_instructions,omitempty"`
+	SupportsReasoning           *bool                            `yaml:"supports_reasoning,omitempty" json:"supports_reasoning,omitempty"`
 	DefaultReasoningLevel       string                           `yaml:"default_reasoning_level,omitempty" json:"default_reasoning_level,omitempty"`
 	SupportedReasoningLevels    []ReasoningLevelPresetFileConfig `yaml:"supported_reasoning_levels,omitempty" json:"supported_reasoning_levels,omitempty"`
 	SupportsReasoningSummaries  *bool                            `yaml:"supports_reasoning_summaries,omitempty" json:"supports_reasoning_summaries,omitempty"`
@@ -127,6 +129,37 @@ type OfferFileConfig struct {
 	Priority     int                    `yaml:"priority,omitempty" json:"priority,omitempty"`
 	Pricing      ModelPricingFileConfig `yaml:"pricing,omitempty" json:"pricing,omitempty"`
 	Overrides    *ModelDefFileConfig    `yaml:"overrides,omitempty" json:"overrides,omitempty"`
+}
+
+type offerFileConfigWire struct {
+	Model        string                  `yaml:"model" json:"model"`
+	UpstreamName string                  `yaml:"upstream_name,omitempty" json:"upstream_name,omitempty"`
+	Priority     int                     `yaml:"priority,omitempty" json:"priority,omitempty"`
+	Pricing      *ModelPricingFileConfig `yaml:"pricing,omitempty" json:"pricing,omitempty"`
+	Overrides    *ModelDefFileConfig     `yaml:"overrides,omitempty" json:"overrides,omitempty"`
+}
+
+func (cfg OfferFileConfig) MarshalYAML() (any, error) {
+	return cfg.toWire(), nil
+}
+
+func (cfg OfferFileConfig) MarshalJSON() ([]byte, error) {
+	return json.Marshal(cfg.toWire())
+}
+
+func (cfg OfferFileConfig) toWire() offerFileConfigWire {
+	var pricing *ModelPricingFileConfig
+	if !cfg.Pricing.IsZero() {
+		value := cfg.Pricing
+		pricing = &value
+	}
+	return offerFileConfigWire{
+		Model:        cfg.Model,
+		UpstreamName: cfg.UpstreamName,
+		Priority:     cfg.Priority,
+		Pricing:      pricing,
+		Overrides:    cfg.Overrides,
+	}
 }
 
 type ProviderDefFileConfig struct {
@@ -182,6 +215,13 @@ type ModelPricingFileConfig struct {
 	CacheReadPrice  float64 `yaml:"cache_read_price" json:"cache_read_price,omitempty"`
 }
 
+func (cfg ModelPricingFileConfig) IsZero() bool {
+	return cfg.InputPrice == 0 &&
+		cfg.OutputPrice == 0 &&
+		cfg.CacheWritePrice == 0 &&
+		cfg.CacheReadPrice == 0
+}
+
 // ReasoningLevelPresetFileConfig maps to Codex's ReasoningEffortPreset.
 type ReasoningLevelPresetFileConfig struct {
 	Effort      string `yaml:"effort" json:"effort,omitempty"`
@@ -189,11 +229,66 @@ type ReasoningLevelPresetFileConfig struct {
 }
 
 type WebSearchFileConfig struct {
-	Support         string `yaml:"support" json:"support,omitempty"`
-	MaxUses         int    `yaml:"max_uses" json:"max_uses,omitempty"`
-	TavilyAPIKey    string `yaml:"tavily_api_key" json:"tavily_api_key,omitempty"`
-	FirecrawlAPIKey string `yaml:"firecrawl_api_key" json:"firecrawl_api_key,omitempty"`
-	SearchMaxRounds int    `yaml:"search_max_rounds" json:"search_max_rounds,omitempty"`
+	Support         string         `yaml:"support" json:"support,omitempty"`
+	MaxUses         int            `yaml:"max_uses" json:"max_uses,omitempty"`
+	TavilyAPIKey    string         `yaml:"tavily_api_key" json:"tavily_api_key,omitempty"`
+	FirecrawlAPIKey string         `yaml:"firecrawl_api_key" json:"firecrawl_api_key,omitempty"`
+	SearchMaxRounds int            `yaml:"search_max_rounds" json:"search_max_rounds,omitempty"`
+	Extra           map[string]any `yaml:",inline" json:"-"`
+}
+
+func (cfg *WebSearchFileConfig) UnmarshalYAML(value *yaml.Node) error {
+	type plain WebSearchFileConfig
+	var out plain
+	if err := value.Decode(&out); err != nil {
+		return err
+	}
+	cfg.Support = out.Support
+	cfg.MaxUses = out.MaxUses
+	cfg.TavilyAPIKey = out.TavilyAPIKey
+	cfg.FirecrawlAPIKey = out.FirecrawlAPIKey
+	cfg.SearchMaxRounds = out.SearchMaxRounds
+	cfg.Extra = removeKnownKeys(out.Extra, webSearchKnownKeys)
+	return nil
+}
+
+func (cfg WebSearchFileConfig) MarshalYAML() (any, error) {
+	return mergeKnownFields(cfg.Extra, map[string]any{
+		"support":           emptyStringAsNil(cfg.Support),
+		"max_uses":          emptyIntAsNil(cfg.MaxUses),
+		"tavily_api_key":    emptyStringAsNil(cfg.TavilyAPIKey),
+		"firecrawl_api_key": emptyStringAsNil(cfg.FirecrawlAPIKey),
+		"search_max_rounds": emptyIntAsNil(cfg.SearchMaxRounds),
+	}), nil
+}
+
+func (cfg *WebSearchFileConfig) UnmarshalJSON(data []byte) error {
+	type plain WebSearchFileConfig
+	var out plain
+	if err := json.Unmarshal(data, &out); err != nil {
+		return err
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	cfg.Support = out.Support
+	cfg.MaxUses = out.MaxUses
+	cfg.TavilyAPIKey = out.TavilyAPIKey
+	cfg.FirecrawlAPIKey = out.FirecrawlAPIKey
+	cfg.SearchMaxRounds = out.SearchMaxRounds
+	cfg.Extra = removeKnownKeys(raw, webSearchKnownKeys)
+	return nil
+}
+
+func (cfg WebSearchFileConfig) MarshalJSON() ([]byte, error) {
+	return json.Marshal(mergeKnownFields(cfg.Extra, map[string]any{
+		"support":           emptyStringAsNil(cfg.Support),
+		"max_uses":          emptyIntAsNil(cfg.MaxUses),
+		"tavily_api_key":    emptyStringAsNil(cfg.TavilyAPIKey),
+		"firecrawl_api_key": emptyStringAsNil(cfg.FirecrawlAPIKey),
+		"search_max_rounds": emptyIntAsNil(cfg.SearchMaxRounds),
+	}))
 }
 
 type PersistenceFileConfig struct {
@@ -279,15 +374,11 @@ func ResolveConfigPath(explicitPath string) (string, error) {
 }
 
 func XDGDefaultConfigPath() (string, error) {
-	base := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME"))
-	if base == "" {
-		home := strings.TrimSpace(os.Getenv("HOME"))
-		if home == "" {
-			return "", errors.New("HOME is not set and XDG_CONFIG_HOME is empty")
-		}
-		base = filepath.Join(home, ".config")
+	home := strings.TrimSpace(os.Getenv("HOME"))
+	if home == "" {
+		return "", errors.New("HOME is not set")
 	}
-	return filepath.Join(base, AppConfigDirName, DefaultConfigFileName), nil
+	return filepath.Join(home, AppConfigDirName, DefaultConfigFileName), nil
 }
 
 func FromFileConfig(fileConfig FileConfig) (Config, error) {
@@ -368,6 +459,7 @@ func FromFileConfigWithOptions(fileConfig FileConfig, opts LoadOptions) (Config,
 		TavilyAPIKey:     strings.TrimSpace(fileConfig.WebSearch.TavilyAPIKey),
 		FirecrawlAPIKey:  strings.TrimSpace(fileConfig.WebSearch.FirecrawlAPIKey),
 		SearchMaxRounds:  intOrDefault(fileConfig.WebSearch.SearchMaxRounds, 5),
+		WebSearchExtra:   cloneAnyMap(fileConfig.WebSearch.Extra),
 		DefaultMaxTokens: intOrDefault(defaults.MaxTokens, 1024),
 		Cache:            fromCacheFileConfig(fileConfig.Cache),
 		Persistence:      FromPersistenceFileConfig(fileConfig.Persistence),
@@ -400,14 +492,15 @@ func fromModelDefFileConfig(fileConfig map[string]ModelDefFileConfig, specs exte
 			return nil, err
 		}
 		ws := WebSearchConfig{}
-		if m.WebSearch.Support != "" {
+		if hasWebSearchFileConfig(m.WebSearch) {
 			wsSupport, _ := parseWebSearchSupport(m.WebSearch.Support)
 			ws = WebSearchConfig{
-				Support:         wsSupport,
+				Support:         explicitWebSearchSupport(m.WebSearch.Support, wsSupport),
 				MaxUses:         m.WebSearch.MaxUses,
 				TavilyAPIKey:    strings.TrimSpace(m.WebSearch.TavilyAPIKey),
 				FirecrawlAPIKey: strings.TrimSpace(m.WebSearch.FirecrawlAPIKey),
 				SearchMaxRounds: m.WebSearch.SearchMaxRounds,
+				Extra:           cloneAnyMap(m.WebSearch.Extra),
 			}
 		}
 		var reasoningPresets []ReasoningLevelPreset
@@ -417,12 +510,20 @@ func fromModelDefFileConfig(fileConfig map[string]ModelDefFileConfig, specs exte
 				Description: strings.TrimSpace(p.Description),
 			})
 		}
+		supportsReasoning := boolOrDefault(
+			m.SupportsReasoning,
+			len(reasoningPresets) > 0 ||
+				strings.TrimSpace(m.DefaultReasoningLevel) != "" ||
+				boolOrDefault(m.SupportsReasoningSummaries, false) ||
+				strings.TrimSpace(m.DefaultReasoningSummary) != "",
+		)
 		models[trimmedSlug] = ModelDef{
 			ContextWindow:               m.ContextWindow,
 			MaxOutputTokens:             m.MaxOutputTokens,
 			DisplayName:                 strings.TrimSpace(m.DisplayName),
 			Description:                 strings.TrimSpace(m.Description),
 			BaseInstructions:            strings.TrimSpace(m.BaseInstructions),
+			SupportsReasoning:           supportsReasoning,
 			DefaultReasoningLevel:       strings.TrimSpace(m.DefaultReasoningLevel),
 			SupportedReasoningLevels:    reasoningPresets,
 			SupportsReasoningSummaries:  boolOrDefault(m.SupportsReasoningSummaries, false),
@@ -510,6 +611,7 @@ func fromProviderDefFileConfig(fileConfig map[string]ProviderDefFileConfig, spec
 				DisplayName:                 modelDef.DisplayName,
 				Description:                 modelDef.Description,
 				BaseInstructions:            modelDef.BaseInstructions,
+				SupportsReasoning:           modelDef.SupportsReasoning,
 				DefaultReasoningLevel:       modelDef.DefaultReasoningLevel,
 				SupportedReasoningLevels:    modelDef.SupportedReasoningLevels,
 				SupportsReasoningSummaries:  modelDef.SupportsReasoningSummaries,
@@ -537,6 +639,7 @@ func fromProviderDefFileConfig(fileConfig map[string]ProviderDefFileConfig, spec
 			TavilyAPIKey:     strings.TrimSpace(def.WebSearch.TavilyAPIKey),
 			FirecrawlAPIKey:  strings.TrimSpace(def.WebSearch.FirecrawlAPIKey),
 			SearchMaxRounds:  def.WebSearch.SearchMaxRounds,
+			WebSearchExtra:   cloneAnyMap(def.WebSearch.Extra),
 			Extensions:       providerExtensions,
 			Models:           providerModels,
 			Offers:           offers,
@@ -564,6 +667,9 @@ func mergeModelDefOverrides(base ModelDef, override ModelDefFileConfig) ModelDef
 	if v := strings.TrimSpace(override.BaseInstructions); v != "" {
 		out.BaseInstructions = v
 	}
+	if override.SupportsReasoning != nil {
+		out.SupportsReasoning = *override.SupportsReasoning
+	}
 	if v := strings.TrimSpace(override.DefaultReasoningLevel); v != "" {
 		out.DefaultReasoningLevel = v
 	}
@@ -589,14 +695,15 @@ func mergeModelDefOverrides(base ModelDef, override ModelDefFileConfig) ModelDef
 	if override.SupportsImageDetailOriginal != nil {
 		out.SupportsImageDetailOriginal = *override.SupportsImageDetailOriginal
 	}
-	if override.WebSearch.Support != "" {
+	if hasWebSearchFileConfig(override.WebSearch) {
 		wsSupport, _ := parseWebSearchSupport(override.WebSearch.Support)
 		out.WebSearch = WebSearchConfig{
-			Support:         wsSupport,
+			Support:         explicitWebSearchSupport(override.WebSearch.Support, wsSupport),
 			MaxUses:         override.WebSearch.MaxUses,
 			TavilyAPIKey:    strings.TrimSpace(override.WebSearch.TavilyAPIKey),
 			FirecrawlAPIKey: strings.TrimSpace(override.WebSearch.FirecrawlAPIKey),
 			SearchMaxRounds: override.WebSearch.SearchMaxRounds,
+			Extra:           cloneAnyMap(override.WebSearch.Extra),
 		}
 	}
 	if override.Extensions != nil {
@@ -608,6 +715,7 @@ func mergeModelDefOverrides(base ModelDef, override ModelDefFileConfig) ModelDef
 			out.Extensions[k] = ExtensionSettings{
 				Enabled:   enabled,
 				RawConfig: cloneAnyMap(v.Config),
+				Extra:     cloneAnyMap(v.Extra),
 			}
 		}
 	}
@@ -631,26 +739,21 @@ func applyModelOverrides(meta *ModelMeta, override ModelDef) {
 	if v := strings.TrimSpace(override.BaseInstructions); v != "" {
 		meta.BaseInstructions = v
 	}
+	meta.SupportsReasoning = override.SupportsReasoning
 	if v := strings.TrimSpace(override.DefaultReasoningLevel); v != "" {
 		meta.DefaultReasoningLevel = v
 	}
 	if len(override.SupportedReasoningLevels) > 0 {
 		meta.SupportedReasoningLevels = override.SupportedReasoningLevels
 	}
-	// Note: for bool fields we only override when true because ModelDef uses
-	// plain bool (not *bool), so we can't distinguish "unset" from "false".
-	if override.SupportsReasoningSummaries {
-		meta.SupportsReasoningSummaries = true
-	}
+	meta.SupportsReasoningSummaries = override.SupportsReasoningSummaries
 	if v := strings.TrimSpace(override.DefaultReasoningSummary); v != "" {
 		meta.DefaultReasoningSummary = v
 	}
 	if len(override.InputModalities) > 0 {
 		meta.InputModalities = override.InputModalities
 	}
-	if override.SupportsImageDetailOriginal {
-		meta.SupportsImageDetailOriginal = true
-	}
+	meta.SupportsImageDetailOriginal = override.SupportsImageDetailOriginal
 }
 
 // buildRoutes parses route specs and merges model metadata.
@@ -723,18 +826,20 @@ func buildRoutes(rawRoutes map[string]RouteFileConfig, providerDefs map[string]P
 
 		// Merge model def metadata into route entry.
 		if modelDef, ok := models[modelSlug]; ok {
-			entry.ContextWindow = modelDef.ContextWindow
-			entry.MaxOutputTokens = modelDef.MaxOutputTokens
-			_ = modelDef.DisplayName // route DisplayName comes from explicit config, not model def
-			entry.Description = modelDef.Description
-			entry.BaseInstructions = modelDef.BaseInstructions
-			entry.DefaultReasoningLevel = modelDef.DefaultReasoningLevel
-			entry.SupportedReasoningLevels = modelDef.SupportedReasoningLevels
-			entry.SupportsReasoningSummaries = modelDef.SupportsReasoningSummaries
-			entry.DefaultReasoningSummary = modelDef.DefaultReasoningSummary
-			entry.InputModalities = modelDef.InputModalities
-			entry.SupportsImageDetailOriginal = modelDef.SupportsImageDetailOriginal
-			entry.WebSearch = modelDef.WebSearch
+			applyRouteModelDef(&entry, modelDef)
+		}
+
+		// Provider offer overrides are merged with base model defs earlier; apply
+		// them after base metadata so named routes match direct provider/model refs.
+		if providerKey != "" {
+			if def, ok := providerDefs[providerKey]; ok {
+				for _, offer := range def.Offers {
+					if offer.Model == modelSlug && offer.Overrides != nil {
+						applyRouteModelDef(&entry, *offer.Overrides)
+						break
+					}
+				}
+			}
 		}
 
 		// Route-level overrides.
@@ -747,20 +852,37 @@ func buildRoutes(rawRoutes map[string]RouteFileConfig, providerDefs map[string]P
 		if routeCfg.ContextWindow > 0 {
 			entry.ContextWindow = routeCfg.ContextWindow
 		}
-		if routeCfg.WebSearch.Support != "" {
+		if hasWebSearchFileConfig(routeCfg.WebSearch) {
 			wsSupport, _ := parseWebSearchSupport(routeCfg.WebSearch.Support)
 			entry.WebSearch = WebSearchConfig{
-				Support:         wsSupport,
+				Support:         explicitWebSearchSupport(routeCfg.WebSearch.Support, wsSupport),
 				MaxUses:         routeCfg.WebSearch.MaxUses,
 				TavilyAPIKey:    strings.TrimSpace(routeCfg.WebSearch.TavilyAPIKey),
 				FirecrawlAPIKey: strings.TrimSpace(routeCfg.WebSearch.FirecrawlAPIKey),
 				SearchMaxRounds: routeCfg.WebSearch.SearchMaxRounds,
+				Extra:           cloneAnyMap(routeCfg.WebSearch.Extra),
 			}
 		}
 
 		routes[trimmedAlias] = entry
 	}
 	return routes, nil
+}
+
+func applyRouteModelDef(entry *RouteEntry, modelDef ModelDef) {
+	entry.ContextWindow = modelDef.ContextWindow
+	entry.MaxOutputTokens = modelDef.MaxOutputTokens
+	_ = modelDef.DisplayName // route DisplayName comes from explicit config, not model def
+	entry.Description = modelDef.Description
+	entry.BaseInstructions = modelDef.BaseInstructions
+	entry.SupportsReasoning = modelDef.SupportsReasoning
+	entry.DefaultReasoningLevel = modelDef.DefaultReasoningLevel
+	entry.SupportedReasoningLevels = modelDef.SupportedReasoningLevels
+	entry.SupportsReasoningSummaries = modelDef.SupportsReasoningSummaries
+	entry.DefaultReasoningSummary = modelDef.DefaultReasoningSummary
+	entry.InputModalities = modelDef.InputModalities
+	entry.SupportsImageDetailOriginal = modelDef.SupportsImageDetailOriginal
+	entry.WebSearch = modelDef.WebSearch
 }
 
 // parseRouteSpec splits "provider/model" into (provider, model).
@@ -795,6 +917,22 @@ func parseWebSearchSupport(value string) (WebSearchSupport, error) {
 	default:
 		return "", fmt.Errorf("invalid web_search.support %q", value)
 	}
+}
+
+func explicitWebSearchSupport(raw string, parsed WebSearchSupport) WebSearchSupport {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	return parsed
+}
+
+func hasWebSearchFileConfig(cfg WebSearchFileConfig) bool {
+	return strings.TrimSpace(cfg.Support) != "" ||
+		cfg.MaxUses != 0 ||
+		strings.TrimSpace(cfg.TavilyAPIKey) != "" ||
+		strings.TrimSpace(cfg.FirecrawlAPIKey) != "" ||
+		cfg.SearchMaxRounds != 0 ||
+		len(cfg.Extra) > 0
 }
 
 func FromResponseProxyFileConfig(fileConfig ProxyTargetFileConfig) ResponseProxyConfig {

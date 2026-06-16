@@ -209,6 +209,102 @@ func (s *Store) Query(opts QueryOptions) ([]Record, error) {
 	return records, nil
 }
 
+// UsageModelAggregate holds aggregated usage for one model over a window.
+type UsageModelAggregate struct {
+	Model         string
+	ActualModel   string
+	Requests      int64
+	InputTokens   int64
+	OutputTokens  int64
+	CacheCreation int64
+	CacheRead     int64
+	Cost          float64
+}
+
+// UsageAggregate holds aggregated usage totals plus per-model rows for a window.
+type UsageAggregate struct {
+	Requests      int64
+	InputTokens   int64
+	OutputTokens  int64
+	CacheCreation int64
+	CacheRead     int64
+	Cost          float64
+	Earliest      time.Time
+	Latest        time.Time
+	ByModel       []UsageModelAggregate
+}
+
+// AggregateUsage returns aggregated usage for the [since, until) window using
+// SQL aggregation. Zero Since/Until are treated as open bounds.
+func (s *Store) AggregateUsage(since, until time.Time) (UsageAggregate, error) {
+	var agg UsageAggregate
+	if s == nil || s.s == nil {
+		return agg, nil
+	}
+	table, err := s.s.Table("request_metrics")
+	if err != nil {
+		return agg, err
+	}
+
+	var where []string
+	var args []any
+	if !since.IsZero() {
+		where = append(where, "timestamp >= ?")
+		args = append(args, since.UTC().Format(time.RFC3339Nano))
+	}
+	if !until.IsZero() {
+		where = append(where, "timestamp < ?")
+		args = append(args, until.UTC().Format(time.RFC3339Nano))
+	}
+	whereSQL := ""
+	if len(where) > 0 {
+		whereSQL = " WHERE " + joinClauses(where)
+	}
+
+	modelQuery := fmt.Sprintf(`SELECT model, actual_model, COUNT(*),
+		COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+		COALESCE(SUM(cache_creation), 0), COALESCE(SUM(cache_read), 0),
+		COALESCE(SUM(cost), 0)
+		FROM %s%s GROUP BY model, actual_model`, table, whereSQL)
+	rows, err := s.s.QueryContext(context.Background(), modelQuery, args...)
+	if err != nil {
+		return agg, fmt.Errorf("aggregate metrics: %w", err)
+	}
+	for rows.Next() {
+		var m UsageModelAggregate
+		if err := rows.Scan(&m.Model, &m.ActualModel, &m.Requests,
+			&m.InputTokens, &m.OutputTokens, &m.CacheCreation, &m.CacheRead, &m.Cost); err != nil {
+			rows.Close()
+			return agg, fmt.Errorf("scan metrics aggregate: %w", err)
+		}
+		agg.Requests += m.Requests
+		agg.InputTokens += m.InputTokens
+		agg.OutputTokens += m.OutputTokens
+		agg.CacheCreation += m.CacheCreation
+		agg.CacheRead += m.CacheRead
+		agg.Cost += m.Cost
+		agg.ByModel = append(agg.ByModel, m)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return agg, fmt.Errorf("iterate metrics aggregate: %w", err)
+	}
+	rows.Close()
+
+	boundsQuery := fmt.Sprintf("SELECT MIN(timestamp), MAX(timestamp) FROM %s%s", table, whereSQL)
+	var minTS, maxTS *string
+	if err := s.s.QueryRowContext(context.Background(), boundsQuery, args...).Scan(&minTS, &maxTS); err == nil {
+		if minTS != nil {
+			agg.Earliest, _ = time.Parse(time.RFC3339Nano, *minTS)
+		}
+		if maxTS != nil {
+			agg.Latest, _ = time.Parse(time.RFC3339Nano, *maxTS)
+		}
+	}
+
+	return agg, nil
+}
+
 func joinClauses(clauses []string) string {
 	result := ""
 	for i, c := range clauses {

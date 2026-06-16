@@ -15,20 +15,35 @@ type ConsumeFunc func(entries []LogEntry) []LogEntry
 // a pointer to the same consumeState, so a later SetConsumeFunc call on
 // the root handler is visible to every derived logger.
 type consumeState struct {
-	mu sync.RWMutex
-	fn ConsumeFunc
+	mu    sync.RWMutex
+	funcs []ConsumeFunc
 }
 
-func (s *consumeState) load() ConsumeFunc {
+func (s *consumeState) load() []ConsumeFunc {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.fn
+	out := make([]ConsumeFunc, len(s.funcs))
+	copy(out, s.funcs)
+	return out
 }
 
 func (s *consumeState) store(fn ConsumeFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.fn = fn
+	if fn == nil {
+		s.funcs = nil
+		return
+	}
+	s.funcs = []ConsumeFunc{fn}
+}
+
+func (s *consumeState) append(fn ConsumeFunc) {
+	if fn == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.funcs = append(s.funcs, fn)
 }
 
 // consumeHandler wraps an inner slog.Handler and dispatches every log record
@@ -65,10 +80,10 @@ func (h *consumeHandler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 func (h *consumeHandler) Handle(ctx context.Context, r slog.Record) error {
-	fn := h.consume.load()
+	funcs := h.consume.load()
 
 	// Fast path: no consume function registered, delegate directly.
-	if fn == nil {
+	if len(funcs) == 0 {
 		return h.inner.Handle(ctx, r)
 	}
 
@@ -102,7 +117,13 @@ func (h *consumeHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 
 	// Run through consume pipeline (single-entry batch).
-	result := fn([]LogEntry{entry})
+	result := []LogEntry{entry}
+	for _, fn := range funcs {
+		result = fn(result)
+		if len(result) == 0 {
+			return nil // consumed/suppressed
+		}
+	}
 	if len(result) == 0 {
 		return nil // consumed/suppressed
 	}
@@ -152,4 +173,9 @@ func (h *consumeHandler) WithGroup(name string) slog.Handler {
 // SetConsumeFunc sets the consume function on this handler.
 func (h *consumeHandler) SetConsumeFunc(fn ConsumeFunc) {
 	h.consume.store(fn)
+}
+
+// AddConsumeFunc appends a consume function to this handler.
+func (h *consumeHandler) AddConsumeFunc(fn ConsumeFunc) {
+	h.consume.append(fn)
 }

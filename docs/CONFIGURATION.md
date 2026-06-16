@@ -2,7 +2,11 @@
 
 > 完整示例见 [`config.example.yml`](config.example.yml)，JSON Schema 见 [`config.schema.json`](config.schema.json)
 
-Moon Bridge 使用 YAML 配置文件。默认路径为当前目录下的 `config.yml`，通过 `-config <path>` 可指定任意路径。
+Moon Bridge 使用 YAML 配置文件。未传 `-config` 时默认读取 `$HOME/moonbridge/config.yml`；如果该文件不存在，会自动创建 starter 配置后继续启动。starter 配置启用 SQLite，数据库路径为 `$HOME/moonbridge/data/moonbridge.db`。
+
+通过 `-config <path>` 可指定任意路径；显式 `-config` 指向的文件不存在时不会自动创建，程序会 fail fast。
+
+Web Console 的常规配置流程不要求用户直接编辑 YAML 或了解配置文件路径。启用持久化存储后，Console 通过 `/api/v1/config/graph` 以资源字段形式实时保存配置；YAML 文件仍保留给 CLI、部署脚本、备份、迁移和管理员批量编辑使用。
 
 ## 顶层结构
 
@@ -22,6 +26,39 @@ system_prompt: ""  # 全局 system prompt（可选）
 defaults:
   model: "moonbridge"
   max_tokens: 65536
+```
+
+## Web Console 与配置图
+
+Console 将当前 `FileConfig` 映射为配置图资源：
+
+| Console 页面 | 主要资源 |
+|--------------|----------|
+| Overview | `mode`、运行态、校验状态、重启要求 |
+| Models & Providers | `provider`、`provider_offer`、`model` |
+| Routes | `route` |
+| Defaults | `defaults`、`trace`、`log` |
+| Search & Tools | `web_search`、`extension`、`proxy` |
+| Storage | `cache`、`persistence` |
+| Security | `server` |
+| Logs | 后台日志输出，不修改配置 |
+
+字段编辑会发送配置图 patch。普通可热重载字段提交后直接生效；`server`、`mode`、`proxy`、`persistence` 等字段可能显示需要重启。密钥字段在读取时脱敏，Console 将其作为 write-only 输入处理。
+
+使用 Console 前通常需要启用持久化配置存储，例如 SQLite：
+
+```yaml
+persistence:
+  active_provider: db_sqlite
+
+extensions:
+  db_sqlite:
+    enabled: true
+    config:
+      path: ~/.moon-bridge/moonbridge.db
+      wal: true
+      busy_timeout_ms: 5000
+      max_open_conns: 1
 ```
 
 ## Mode
@@ -203,7 +240,7 @@ proxy:
 
 | 标志 | 默认值 | 说明 |
 |------|--------|------|
-| `-config` | `${XDG_CONFIG_HOME}/moonbridge/config.yml` | 配置文件路径 |
+| `-config` | `$HOME/moonbridge/config.yml` | 配置文件路径 |
 | `-addr` | 来自配置文件 | 覆盖监听地址 |
 | `-mode` | 来自配置文件 | 覆盖运行模式（Transform/CaptureAnthropic/CaptureResponse） |
 | `-print-addr` | — | 打印配置的监听地址后退出 |

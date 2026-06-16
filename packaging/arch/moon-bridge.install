@@ -1,0 +1,26 @@
+post_install() {
+  cat <<'EOF'
+Moon Bridge has been installed as /usr/bin/moonbridge.
+
+Default config path:
+  ~/moonbridge/config.yml
+
+Start Moon Bridge after installation:
+  moonbridge
+
+Open Web Console:
+  http://127.0.0.1:38440/console/
+
+On first run without an existing default config, Moon Bridge creates:
+  ~/moonbridge/config.yml
+
+Example configs remain available under:
+  /usr/share/doc/moon-bridge/
+
+Replace provider, model, and API key placeholders before sending real upstream requests.
+EOF
+}
+
+post_upgrade() {
+  post_install
+}

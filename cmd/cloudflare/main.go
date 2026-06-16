@@ -98,7 +98,7 @@ func main() {
 	defer plugins.ShutdownAll()
 
 	// Wire plugin LogConsumer into the slog consume pipeline.
-	logger.SetConsumeFunc(func(entries []logger.LogEntry) []logger.LogEntry {
+	logger.AddConsumeFunc(func(entries []logger.LogEntry) []logger.LogEntry {
 		return plugins.ConsumeGlobalLog(entries)
 	})
 

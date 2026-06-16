@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"moonbridge/internal/config"
+	"moonbridge/internal/extension/visual"
 )
 
 func TestConfigToFileConfigRoundtrip(t *testing.T) {
@@ -306,7 +307,123 @@ routes:
 	}
 }
 
+func TestConfigToFileConfigRoundtripPreservesFeatureExtras(t *testing.T) {
+	enabled := true
+	disabled := false
+	input := []byte(`
+mode: Transform
+web_search:
+  provider_tool: global-preview
+extensions:
+  visual:
+    enabled: true
+    scope_note: global-extra
+    config:
+      provider: main
+      model: claude-test
+models:
+  claude-test:
+    context_window: 200000
+    web_search:
+      provider_tool: model-preview
+    extensions:
+      visual:
+        enabled: false
+        scope_note: model-extra
+        config:
+          provider: main
+          model: claude-test
+providers:
+  main:
+    base_url: https://provider.example.test
+    api_key: upstream-key
+    web_search:
+      provider_tool: provider-preview
+    extensions:
+      visual:
+        enabled: true
+        scope_note: provider-extra
+        config:
+          provider: main
+          model: claude-test
+    offers:
+      - model: claude-test
+routes:
+  moonbridge:
+    model: claude-test
+    provider: main
+    web_search:
+      provider_tool: route-preview
+    extensions:
+      visual:
+        enabled: true
+        scope_note: route-extra
+        config:
+          provider: main
+          model: claude-test
+`)
+
+	cfg, err := config.LoadFromYAMLWithOptions(input, config.LoadOptions{ExtensionSpecs: visual.ConfigSpecs()})
+	if err != nil {
+		t.Fatalf("LoadFromYAML() error = %v", err)
+	}
+
+	fc := cfg.ToFileConfig()
+	if fc.WebSearch.Extra["provider_tool"] != "global-preview" {
+		t.Fatalf("top-level web_search extra = %#v, want global-preview", fc.WebSearch.Extra["provider_tool"])
+	}
+	checkExtensionExtra(t, fc.Extensions["visual"], &enabled, "global-extra")
+	if fc.Models["claude-test"].WebSearch.Extra["provider_tool"] != "model-preview" {
+		t.Fatalf("model web_search extra = %#v, want model-preview", fc.Models["claude-test"].WebSearch.Extra["provider_tool"])
+	}
+	checkExtensionExtra(t, fc.Models["claude-test"].Extensions["visual"], &disabled, "model-extra")
+	if fc.Providers["main"].WebSearch.Extra["provider_tool"] != "provider-preview" {
+		t.Fatalf("provider web_search extra = %#v, want provider-preview", fc.Providers["main"].WebSearch.Extra["provider_tool"])
+	}
+	checkExtensionExtra(t, fc.Providers["main"].Extensions["visual"], &enabled, "provider-extra")
+	if fc.Routes["moonbridge"].WebSearch.Extra["provider_tool"] != "route-preview" {
+		t.Fatalf("route web_search extra = %#v, want route-preview", fc.Routes["moonbridge"].WebSearch.Extra["provider_tool"])
+	}
+	checkExtensionExtra(t, fc.Routes["moonbridge"].Extensions["visual"], &enabled, "route-extra")
+
+	data, err := fc.MarshalYAML()
+	if err != nil {
+		t.Fatalf("MarshalYAML() error = %v", err)
+	}
+	reloaded, err := config.LoadFromYAMLWithOptions(data, config.LoadOptions{ExtensionSpecs: visual.ConfigSpecs()})
+	if err != nil {
+		t.Fatalf("second LoadFromYAML() error = %v\n--- marshaled YAML ---\n%s", err, string(data))
+	}
+	fc2 := reloaded.ToFileConfig()
+	if fc2.WebSearch.Extra["provider_tool"] != "global-preview" {
+		t.Fatalf("reloaded top-level web_search extra = %#v, want global-preview", fc2.WebSearch.Extra["provider_tool"])
+	}
+	if fc2.Models["claude-test"].WebSearch.Extra["provider_tool"] != "model-preview" {
+		t.Fatalf("reloaded model web_search extra = %#v, want model-preview", fc2.Models["claude-test"].WebSearch.Extra["provider_tool"])
+	}
+	if fc2.Providers["main"].WebSearch.Extra["provider_tool"] != "provider-preview" {
+		t.Fatalf("reloaded provider web_search extra = %#v, want provider-preview", fc2.Providers["main"].WebSearch.Extra["provider_tool"])
+	}
+	if fc2.Routes["moonbridge"].WebSearch.Extra["provider_tool"] != "route-preview" {
+		t.Fatalf("reloaded route web_search extra = %#v, want route-preview", fc2.Routes["moonbridge"].WebSearch.Extra["provider_tool"])
+	}
+}
+
 // --- helpers ---
+
+func checkExtensionExtra(t *testing.T, extension config.ExtensionFileConfig, enabled *bool, wantScopeNote string) {
+	t.Helper()
+	if enabled == nil {
+		if extension.Enabled != nil {
+			t.Fatalf("extension.Enabled = %v, want nil", *extension.Enabled)
+		}
+	} else if extension.Enabled == nil || *extension.Enabled != *enabled {
+		t.Fatalf("extension.Enabled = %v, want %v", extension.Enabled, *enabled)
+	}
+	if extension.Extra["scope_note"] != wantScopeNote {
+		t.Fatalf("extension extra scope_note = %#v, want %s", extension.Extra["scope_note"], wantScopeNote)
+	}
+}
 
 func checkStringEqual(t *testing.T, name, got, want string) {
 	t.Helper()
