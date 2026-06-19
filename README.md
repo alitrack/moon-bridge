@@ -3,7 +3,6 @@
 Moon Bridge 是一个用 Go 编写的协议转换与模型路由代理。**三个入口端点原生支持**：`/v1/messages`（Claude Code）、`/v1/responses`（Codex CLI）、`/v1/chat/completions`（OpenAI Chat 客户端）。所有请求统一转换为内部 CoreRequest，按配置路由到 **Anthropic Messages**、**Google Gemini（GenAI）**、**OpenAI Chat Completions** 等上游协议。客户端指定不同模型别名时，自动将请求路由到对应上游 Provider 并在协议间自动转换。
 
 > 🍳 **新手先看这里** → [CookBook.md](CookBook.md)：一份按目标找做法的菜谱，5 分钟跑通第一个对话。
-> 官方qq群：1103798316
 
 ---
 
