@@ -40,9 +40,10 @@ go run ./cmd/moonbridge -config config.yml
 | 扩展 | 类型 | 功能 |
 |------|------|------|
 | `codex_tool_proxy` | ToolInjector | 为 Codex 注入 `apply_patch` 等工具代理 |
-| `deepseek_v4` | ReasoningExtractor | DeepSeek V4/V3 thinking/reasoning 提取与转换 |
+| `deepseek_v4` | ReasoningExtractor | DeepSeek V4/V3 thinking/reasoning 提取与转换。支持 `persistence: sqlite` 跨重启持久化 |
+| `context_manager` | MessageRewriter | 上下文窗口超限时自动截断历史消息。`cache_preserving: true`（默认）保护 DeepSeek prefix cache，`chars_per_token: 0`（默认）中/英/代码分段估算 |
 | `web_fetch` | ToolInjector + MessageRewriter | 注入 `web_fetch(url)` 工具，代理侧通过 Jina Reader 抓取网页 Markdown，绕过 Codex 沙箱的 HTTP 限制 |
-| `circuit_breaker` | RequestMutator | 按会话统计连续 tool_use 调用次数，超过阈值注入警告或强制终止，防止模型陷入死循环 |
+| `circuit_breaker` | RequestMutator | 按会话统计连续 tool_use 调用次数，超过阈值注入警告或强制终止。`cache_preserving: true`（默认）跳过去重以保护 prefix cache |
 | `response_store` | ResponsePostProcessor | 缓存上游响应，当请求携带 `previous_response_id` 时自动桥接上次 assistant 输出到新请求 Input |
 | `kimi_workaround` | InputPreprocessor | Kimi 模型兼容处理 |
 || `visual` | ContentFilter + ToolInjector | 为纯文本模型注入 `visual_brief` / `visual_qa` 工具，自动剥离图片 block，路由到视觉模型分析后回填结果。支持 5 种场景的自动检测（错误日志/图表/问题定位/UI 布局/OCR），输出特化分析指令 |
@@ -62,6 +63,17 @@ extensions:
     config:
       max_consecutive_tools: 20
       hard_limit: 30
+      cache_preserving: true   # 默认 true — 跳过去重以保护 DeepSeek prefix cache
+  context_manager:
+    enabled: true
+    config:
+      context_limit: 1048576
+      cache_preserving: true   # 默认 true — 仅从头部截断，通知追加到末尾
+      chars_per_token: 0       # 默认 0 — 自动分段（CJK=0.75, code=1.3, Latin=3.8）
+  deepseek_v4:
+    enabled: true
+    config:
+      persistence: sqlite      # 可选 "sqlite" 跨重启持久化 reasoning 缓存
   response_store:
     enabled: true
     config:
@@ -161,6 +173,7 @@ docker run -p 38440:38440 -v $(pwd)/config.yml:/config/config.yml moonbridge
 | `/v1/models` | GET | 列出可用模型 |
 | `/models` | GET | 同上 |
 | `/api/v1/` | — | 管理 API（需启用持久化） |
+| `/api/v1/cache/stats` | GET | 查询 DeepSeek prefix cache 命中率与 token 分布 |
 | `/health` | GET | 健康检查 |
 
 详细 API 文档见 [API.md](docs/api.md)。
