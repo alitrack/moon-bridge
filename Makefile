@@ -1,7 +1,13 @@
-.PHONY: test cover cover-html cover-check build
+.PHONY: test cover cover-html cover-check build release clean
 
 COVERAGE_THRESHOLD := 95
 COVER_PROFILE := /tmp/moonbridge-coverage.out
+BINARY_NAME := moonbridge
+BUILD_DIR := dist
+LDFLAGS := -s -w
+
+# Cross-compile targets (CGO_ENABLED=0, pure Go)
+PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
 build:
 	CGO_ENABLED=0 go build ./...
@@ -30,3 +36,22 @@ cover-check:
 	done; \
 	if [ $$fail -eq 1 ]; then echo "Coverage check FAILED"; exit 1; fi; \
 	echo "Coverage check PASSED"
+
+release:
+	@mkdir -p $(BUILD_DIR)
+	@for platform in $(PLATFORMS); do \
+		os=$$(echo $$platform | cut -d/ -f1); \
+		arch=$$(echo $$platform | cut -d/ -f2); \
+		output="$(BUILD_DIR)/$(BINARY_NAME)-$$os-$$arch"; \
+		if [ "$$os" = "windows" ]; then output="$$output.exe"; fi; \
+		echo "Building $$os/$$arch → $$output"; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build \
+			-ldflags "$(LDFLAGS)" \
+			-o $$output \
+			./cmd/moonbridge/; \
+	done
+	@echo "\nDone! Binaries in $(BUILD_DIR)/:"
+	@ls -lh $(BUILD_DIR)/
+
+clean:
+	rm -rf $(BUILD_DIR)
