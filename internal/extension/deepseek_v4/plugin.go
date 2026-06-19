@@ -28,6 +28,17 @@ const PluginName = "deepseek_v4"
 type Config struct {
 	ReinforceInstructions *bool   `json:"reinforce_instructions,omitempty" yaml:"reinforce_instructions"`
 	ReinforcePrompt       *string `json:"reinforce_prompt,omitempty" yaml:"reinforce_prompt"`
+
+	// Persistence enables persistent reasoning cache via SQLite.
+	// "memory" (default): in-memory only, lost on restart.
+	// "sqlite": SQLite-backed, survives restarts.
+	Persistence string `json:"persistence,omitempty" yaml:"persistence"`
+
+	// ReasoningCacheMaxAgeSeconds is TTL for cached entries (default: 30 days).
+	ReasoningCacheMaxAgeSeconds int `json:"reasoning_cache_max_age_seconds,omitempty" yaml:"reasoning_cache_max_age_seconds"`
+
+	// ReasoningCacheMaxRows caps the total number of cached entries (default: 100,000).
+	ReasoningCacheMaxRows int `json:"reasoning_cache_max_rows,omitempty" yaml:"reasoning_cache_max_rows"`
 }
 
 type EnabledFunc func(modelAlias string) bool
@@ -35,11 +46,12 @@ type EnabledFunc func(modelAlias string) bool
 // DSPlugin implements the new plugin.Plugin interface plus relevant capabilities.
 type DSPlugin struct {
 	plugin.BasePlugin
-	isEnabled     EnabledFunc
-	pluginCfg     config.PluginConfig
-	currentConfig func() config.Config
-	logger        *slog.Logger
-	cfg           *Config
+	isEnabled      EnabledFunc
+	pluginCfg      config.PluginConfig
+	currentConfig  func() config.Config
+	logger         *slog.Logger
+	cfg            *Config
+	sqliteState    *SQLiteState // optional persistent reasoning cache
 }
 
 // NewPlugin creates a DeepSeek V4 plugin.
@@ -70,6 +82,26 @@ func (p *DSPlugin) Init(ctx plugin.PluginContext) error {
 	p.currentConfig = ctx.CurrentConfig
 	p.logger = ctx.Logger
 	p.cfg = plugin.Config[Config](ctx)
+	if p.cfg == nil {
+		p.cfg = &Config{Persistence: "memory"}
+	}
+
+	// Initialize persistent reasoning cache if configured.
+	if p.cfg.Persistence == "sqlite" {
+		dbPath := "" // default ~/.moonbridge/reasoning_cache.sqlite3
+		ss, err := SQLiteStateFromPath(dbPath, p.cfg.ReasoningCacheMaxAgeSeconds, p.cfg.ReasoningCacheMaxRows, nil)
+		if err != nil {
+			if p.logger != nil {
+				p.logger.Warn("failed to open reasoning cache SQLite, falling back to memory only", "error", err)
+			}
+		} else {
+			p.sqliteState = ss
+			if p.logger != nil {
+				p.logger.Info("reasoning cache SQLite initialized", "path", ss.dbPath)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -198,6 +230,12 @@ func (p *DSPlugin) PrependThinkingForToolUse(messages []format.CoreMessage, tool
 	if state != nil {
 		state.PrependCachedForToolUse(&anthroMsgs, toolCallID)
 	}
+	// Fallback to SQLite if in-memory miss + persistence enabled.
+	if !HasThinkingBlock(anthropicBlocksToCore(anthroMsgs[len(anthroMsgs)-1].Content)) && p.sqliteState != nil {
+		if block, ok := p.sqliteState.ReadToolCall(toolCallID); ok {
+			PrependThinkingBlockForToolUse(&anthroMsgs, block)
+		}
+	}
 	if PrependRequiredThinkingForToolUse(&anthroMsgs) {
 		p.warnRequiredThinkingFallback("tool_use", "tool_call_id", toolCallID)
 	}
@@ -300,6 +338,28 @@ func (p *DSPlugin) RememberContent(ctx *plugin.RequestContext, content []format.
 		}
 	}
 	state.RememberFromContent(anthropicBlocksToCore(anthropicBlocks))
+
+	// Persist reasoning to SQLite if enabled.
+	if p.sqliteState != nil {
+		// Extract reasoning block and associated tool-call IDs.
+		var thinkingBlock format.CoreContentBlock
+		var toolCallIDs []string
+		for _, block := range content {
+			switch block.Type {
+			case "reasoning":
+				thinkingBlock = block
+			case "tool_use":
+				if block.ToolUseID != "" {
+					toolCallIDs = append(toolCallIDs, block.ToolUseID)
+				}
+			}
+		}
+		if hasThinkingPayload(thinkingBlock) {
+			for _, id := range toolCallIDs {
+				p.sqliteState.WriteToolCall(id, thinkingBlock)
+			}
+		}
+	}
 }
 
 // RememberCoreContent is the Core format equivalent of RememberContent.

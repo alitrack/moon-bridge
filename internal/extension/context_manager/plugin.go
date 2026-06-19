@@ -24,13 +24,22 @@ type Config struct {
 	// Default: 8,192.
 	CompletionHeadroom int `json:"completion_headroom,omitempty" yaml:"completion_headroom"`
 
-	// CharsPerToken is the conservative estimation ratio.
-	// Default: 2.0 (code/JSON tokenizes more densely than prose).
+	// CharsPerToken is the estimation ratio for token counting.
+	// Default: 0 (auto: CJK=0.75, code=1.3, Latin=3.8).
+	// Set to e.g. 2.0 for legacy fixed-ratio behavior.
 	CharsPerToken float64 `json:"chars_per_token,omitempty" yaml:"chars_per_token"`
 
 	// MinRecentMessages is the minimum number of recent messages to always keep.
 	// Default: 10.
 	MinRecentMessages int `json:"min_recent_messages,omitempty" yaml:"min_recent_messages"`
+
+	// CachePreserving enables prefix-cache-safe truncation for DeepSeek.
+	// When true (default): only truncate from the front of history (preserving byte
+	// prefix for subsequent messages) and append truncation notices at the
+	// end instead of injecting them mid-stream.
+	// When false: legacy behavior — inject notice between system and history.
+	// Default: true (nil = true).
+	CachePreserving *bool `json:"cache_preserving,omitempty" yaml:"cache_preserving"`
 }
 
 // Plugin implements plugin.Plugin + plugin.MessageRewriter.
@@ -76,10 +85,14 @@ func (p *Plugin) Init(ctx plugin.PluginContext) error {
 		p.cfg.CompletionHeadroom = 8192
 	}
 	if p.cfg.CharsPerToken <= 0 {
-		p.cfg.CharsPerToken = 2.0
+		p.cfg.CharsPerToken = 0 // default to context-aware estimation
 	}
 	if p.cfg.MinRecentMessages <= 0 {
 		p.cfg.MinRecentMessages = 10
+	}
+	if p.cfg.CachePreserving == nil {
+		defaultPreserving := true
+		p.cfg.CachePreserving = &defaultPreserving
 	}
 	p.appCfg = ctx.AppConfig
 	p.currentConfig = ctx.CurrentConfig
@@ -118,6 +131,8 @@ func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.C
 
 	systemTokens := estimateMessagesTokens(systemMsgs, p.cfg.CharsPerToken)
 
+	originalHistoryLen := len(historyMsgs)
+
 	// Drop oldest messages from the front until within budget.
 	// Always keep the most recent MinRecentMessages.
 	minKeep := p.cfg.MinRecentMessages
@@ -130,7 +145,9 @@ func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.C
 	}
 
 	// Inject truncation notice if messages were dropped.
-	if len(historyMsgs) < len(messages)-len(systemMsgs) {
+	// Cache-preserving mode: append notice at end to avoid breaking prefix cache.
+	// Legacy mode: inject notice between system and history (breaks cache).
+	if len(historyMsgs) < originalHistoryLen {
 		notice := format.CoreMessage{
 			Role: "user",
 			Content: []format.CoreContentBlock{{
@@ -138,11 +155,20 @@ func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.C
 				Text: "[System: Earlier conversation history has been truncated to fit within the model's context window. Do not repeat previous statements or tool calls you already made. Continue with the current task based on the remaining context above. If you have enough information, respond to the user instead of making more tool calls.]",
 			}},
 		}
-		// Insert after system messages, before history.
-		result := make([]format.CoreMessage, 0, len(systemMsgs)+1+len(historyMsgs))
+		result := make([]format.CoreMessage, 0, len(systemMsgs)+len(historyMsgs)+1)
 		result = append(result, systemMsgs...)
-		result = append(result, notice)
-		result = append(result, historyMsgs...)
+		if p.cfg.CachePreserving != nil && *p.cfg.CachePreserving {
+			// CACHE-SAFE: append notice at the end so the byte prefix of all
+			// preceding messages stays identical — DeepSeek's KV cache hits
+			// on the entire history up to the notice.
+			result = append(result, historyMsgs...)
+			result = append(result, notice)
+		} else {
+			// LEGACY: inject notice between system and history (breaks prefix cache
+			// because all subsequent messages shift by notice length).
+			result = append(result, notice)
+			result = append(result, historyMsgs...)
+		}
 		return result
 	}
 
@@ -154,12 +180,105 @@ func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.C
 }
 
 // estimateMessagesTokens estimates token count for a slice of messages.
+// When charsPerToken <= 0, uses context-aware estimation that distinguishes
+// CJK characters (0.75 chars/token), code/JSON blocks (1.3), and Latin prose (3.8).
+// When charsPerToken > 0, falls back to the legacy fixed-ratio estimator.
 func estimateMessagesTokens(messages []format.CoreMessage, charsPerToken float64) float64 {
+	if charsPerToken > 0 {
+		return estimateFixed(messages, charsPerToken)
+	}
+	var total float64
+	for _, m := range messages {
+		data, _ := json.Marshal(m.Content)
+		total += estimateContextAware(string(data))
+	}
+	return total
+}
+
+func estimateFixed(messages []format.CoreMessage, charsPerToken float64) float64 {
 	var total float64
 	for _, m := range messages {
 		data, _ := json.Marshal(m.Content)
 		total += float64(len(data)) / charsPerToken
 	}
+	return total
+}
+
+// estimateContextAware estimates token count by segmenting text by character
+// type and applying per-type chars/token ratios:
+//
+//	CJK (U+4E00–U+9FFF, U+3400–U+4DBF, U+F900–U+FAFF): 0.75
+//	Code (JSON brackets, braces, operators dominating): 1.3
+//	Latin prose (ASCII letters + spaces): 3.8
+//	Other (symbols, emoji, unknown): 2.0
+func estimateContextAware(text string) float64 {
+	if len(text) == 0 {
+		return 0
+	}
+
+	type segType int
+	const (
+		segCJK   segType = iota
+		segCode
+		segLatin
+		segOther
+	)
+
+	charsPerToken := func(t segType) float64 {
+		switch t {
+		case segCJK:
+			return 0.75
+		case segCode:
+			return 1.3
+		case segLatin:
+			return 3.8
+		default:
+			return 2.0
+		}
+	}
+
+	classify := func(r rune) segType {
+		switch {
+		case r >= 0x4E00 && r <= 0x9FFF:
+			return segCJK
+		case r >= 0x3400 && r <= 0x4DBF:
+			return segCJK
+		case r >= 0xF900 && r <= 0xFAFF:
+			return segCJK
+		case r >= 0x3000 && r <= 0x303F: // CJK punctuation
+			return segCJK
+		case r == '{' || r == '}' || r == '[' || r == ']' || r == '"' || r == ':':
+			return segCode
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == ' ':
+			return segLatin
+		default:
+			// Heuristic: if surrounded by code-like chars, treat as code.
+			return segOther
+		}
+	}
+
+	var total float64
+	var curType segType = -1
+	var segLen int
+
+	flush := func() {
+		if segLen > 0 && curType >= 0 {
+			total += float64(segLen) / charsPerToken(curType)
+		}
+		segLen = 0
+		curType = -1
+	}
+
+	for _, r := range text {
+		t := classify(r)
+		if t != curType || segLen > 256 {
+			flush()
+			curType = t
+		}
+		segLen++
+	}
+	flush()
+
 	return total
 }
 

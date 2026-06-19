@@ -15,8 +15,14 @@ const PluginName = "circuit_breaker"
 const sessionStateKey = "circuit_breaker_state"
 
 type Config struct {
-	MaxConsecutiveTools int `json:"max_consecutive_tools,omitempty" yaml:"max_consecutive_tools"`
-	HardLimit           int `json:"hard_limit,omitempty" yaml:"hard_limit"`
+	MaxConsecutiveTools int  `json:"max_consecutive_tools,omitempty" yaml:"max_consecutive_tools"`
+	HardLimit           int  `json:"hard_limit,omitempty" yaml:"hard_limit"`
+	// CachePreserving enables prefix-cache-safe behavior for DeepSeek.
+	// When true (default): skip tool-call deduplication (dedup removes
+	// message blocks mid-history, breaking DeepSeek's prefix KV cache).
+	// When false: legacy behavior — dedup consecutive identical tool calls.
+	// Default: true (nil = true).
+	CachePreserving *bool `json:"cache_preserving,omitempty" yaml:"cache_preserving"`
 }
 
 type sessionState struct {
@@ -64,6 +70,10 @@ func (p *Plugin) Init(ctx plugin.PluginContext) error {
 	}
 	if p.cfg.HardLimit <= 0 {
 		p.cfg.HardLimit = 30
+	}
+	if p.cfg.CachePreserving == nil {
+		defaultPreserving := true
+		p.cfg.CachePreserving = &defaultPreserving
 	}
 	p.appCfg = ctx.AppConfig
 	p.currentConfig = ctx.CurrentConfig
@@ -145,7 +155,14 @@ func (p *Plugin) MutateRequest(ctx *plugin.RequestContext, req *format.CoreReque
 // RewriteMessages implements plugin.MessageRewriter.
 // Detects and collapses consecutive identical tool_call blocks to prevent
 // DeepSeek/Claude from looping on repeated function calls.
+// When CachePreserving is true (default), deduplication is SKIPPED because
+// removing message blocks mid-history breaks DeepSeek's prefix KV cache.
 func (p *Plugin) RewriteMessages(ctx *plugin.RequestContext, messages []format.CoreMessage) []format.CoreMessage {
+	// Skip dedup in cache-preserving mode: removing message blocks mid-history
+	// shifts byte offsets and breaks DeepSeek's prefix cache.
+	if p.cfg.CachePreserving != nil && *p.cfg.CachePreserving {
+		return messages
+	}
 	// Dedup: collapse consecutive identical tool_use+tool_result pairs
 	return deduplicateToolCalls(messages)
 }

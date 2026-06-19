@@ -51,6 +51,7 @@ type Config struct {
 	SessionManager   session.Manager
 	UsageTracker     usage.Tracker
 	TraceWriter      trace.Writer
+	CacheStats       *CacheStats
 }
 
 type Server struct {
@@ -73,6 +74,7 @@ type Server struct {
 	sessionManager  session.Manager
 	usageTracker    usage.Tracker
 	traceWriter     trace.Writer
+	cacheStats      *CacheStats
 	// visualCache caches Qwen VL descriptions keyed by SHA256 of base64 image data.
 	// Avoids redundant vision calls when the same image appears across multiple
 	// tool-call rounds in a Claude Code conversation.
@@ -152,6 +154,7 @@ func New(cfg Config) *Server {
 		sessionManager:  cfg.SessionManager,
 		usageTracker:    cfg.UsageTracker,
 		traceWriter:     cfg.TraceWriter,
+		cacheStats:      cfg.CacheStats,
 	}
 	s.mux.HandleFunc("/v1/responses", s.handleResponses)
 	s.mux.HandleFunc("/responses", s.handleResponses)
@@ -161,6 +164,9 @@ func New(cfg Config) *Server {
 	s.mux.HandleFunc("/v1/models", s.handleModels)
 	s.mux.HandleFunc("/models", s.handleModels)
 	s.registerPluginRoutes()
+	if s.cacheStats != nil {
+		s.mux.Handle("/api/v1/cache/stats", s.cacheStats)
+	}
 	if cfg.Runtime != nil {
 		apiRouter := api.NewRouter(s.store, s.runtime, s.stats, s.pluginRegistry, s)
 		s.mux.Handle("/api/v1/", http.StripPrefix("/api/v1", apiRouter))

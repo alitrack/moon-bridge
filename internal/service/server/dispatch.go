@@ -29,6 +29,22 @@ func (server *Server) onRequestCompleted(model, actualModel, providerKey string,
 	outputTokens := usage.NormalizedOutputTokens
 	cacheCreation := usage.NormalizedCacheCreation
 	cacheRead := usage.NormalizedCacheRead
+
+	// Record cache stats for monitoring.
+	if server.cacheStats != nil && actualModel != "" {
+		miss := inputTokens - cacheRead - cacheCreation
+		if miss < 0 {
+			miss = 0
+		}
+		_ = miss // for clarity
+		server.cacheStats.Record(actualModel, CacheUsage{
+			InputTokens:      int64(inputTokens),
+			OutputTokens:     int64(outputTokens),
+			CacheReadTokens:  int64(cacheRead),
+			CacheWriteTokens: int64(cacheCreation),
+		})
+	}
+
 	server.pluginRegistry.OnRequestCompleted(
 		&plugin.RequestContext{ModelAlias: model},
 		plugin.RequestResult{
