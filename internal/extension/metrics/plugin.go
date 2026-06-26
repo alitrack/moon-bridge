@@ -271,27 +271,20 @@ func (p *Plugin) handleSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	opts := SummaryOptions{}
-	if since := r.URL.Query().Get("since"); since != "" {
-		if t, err := time.Parse(time.RFC3339Nano, since); err == nil {
-			opts.Since = t
-		}
+	var since, until time.Time
+	if s := r.URL.Query().Get("since"); s != "" {
+		since, _ = time.Parse(time.RFC3339Nano, s)
 	}
-	if until := r.URL.Query().Get("until"); until != "" {
-		if t, err := time.Parse(time.RFC3339Nano, until); err == nil {
-			opts.Until = t
-		}
+	if u := r.URL.Query().Get("until"); u != "" {
+		until, _ = time.Parse(time.RFC3339Nano, u)
 	}
 
-	summary, err := p.metricsStore.Summary(opts)
+	summary, err := p.metricsStore.AggregateUsage(since, until)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
-	}
-	if summary == nil {
-		summary = &Summary{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

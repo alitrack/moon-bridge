@@ -2528,12 +2528,26 @@ func TestFromCoreRequest_ToolResultInImagePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	chatReq := result.(*chat.ChatRequest)
-	parts, ok := chatReq.Messages[0].Content.([]chat.ContentPart)
-	if !ok {
-		t.Fatalf("Content type = %T, want []chat.ContentPart", chatReq.Messages[0].Content)
+	if len(chatReq.Messages) != 2 {
+		t.Fatalf("messages: got %d, want 2 (tool + user)", len(chatReq.Messages))
 	}
-	if len(parts) != 2 {
-		t.Fatalf("parts: got %d, want 2", len(parts))
+	// Message 0: tool role
+	if chatReq.Messages[0].Role != "tool" {
+		t.Errorf("messages[0].Role = %q, want tool", chatReq.Messages[0].Role)
+	}
+	if chatReq.Messages[0].ToolCallID != "call_123" {
+		t.Errorf("messages[0].ToolCallID = %q, want call_123", chatReq.Messages[0].ToolCallID)
+	}
+	// Message 1: user role with image
+	parts, ok := chatReq.Messages[1].Content.([]chat.ContentPart)
+	if !ok {
+		t.Fatalf("messages[1].Content type = %T, want []chat.ContentPart", chatReq.Messages[1].Content)
+	}
+	if len(parts) != 1 {
+		t.Fatalf("parts: got %d, want 1", len(parts))
+	}
+	if parts[0].Type != "image_url" {
+		t.Errorf("parts[0].Type = %q, want image_url", parts[0].Type)
 	}
 }
 
@@ -2555,12 +2569,20 @@ func TestFromCoreRequest_ToolResultEmptyResultInImagePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	chatReq := result.(*chat.ChatRequest)
-	parts, ok := chatReq.Messages[0].Content.([]chat.ContentPart)
+	if len(chatReq.Messages) != 2 {
+		t.Fatalf("messages: got %d, want 2 (tool + user)", len(chatReq.Messages))
+	}
+	// Message 0: tool role (empty content)
+	if chatReq.Messages[0].Role != "tool" {
+		t.Errorf("messages[0].Role = %q, want tool", chatReq.Messages[0].Role)
+	}
+	// Message 1: user role with image
+	parts, ok := chatReq.Messages[1].Content.([]chat.ContentPart)
 	if !ok {
-		t.Fatalf("Content type = %T, want []chat.ContentPart", chatReq.Messages[0].Content)
+		t.Fatalf("messages[1].Content type = %T, want []chat.ContentPart", chatReq.Messages[1].Content)
 	}
 	if len(parts) != 1 {
-		t.Fatalf("parts: got %d, want 1 (only image, tool_result skipped due to empty text)", len(parts))
+		t.Fatalf("parts: got %d, want 1 (only image)", len(parts))
 	}
 	if parts[0].Type != "image_url" {
 		t.Errorf("parts[0].Type = %q, want image_url", parts[0].Type)

@@ -97,11 +97,19 @@ func (a *ChatProviderAdapter) FromCoreRequest(ctx context.Context, req *format.C
 		// CoreOrchestrator produces: {role:"user", content:[tool_result{id:x}, tool_result{id:y}]}
 		// Chat protocol requires:     {role:"tool", tool_call_id:x}, {role:"tool", tool_call_id:y}
 		if msg.Role == "user" && hasToolResults(msg.Content) {
+			var nonToolBlocks []format.CoreContentBlock
 			for _, b := range msg.Content {
 				if b.Type != "tool_result" {
+					nonToolBlocks = append(nonToolBlocks, b)
 					continue
 				}
 				chatReq.Messages = append(chatReq.Messages, a.toolResultToToolMessage(b))
+			}
+			if len(nonToolBlocks) > 0 {
+				chatReq.Messages = append(chatReq.Messages, a.toChatMessage(format.CoreMessage{
+					Role:    "user",
+					Content: nonToolBlocks,
+				}))
 			}
 			continue
 		}
