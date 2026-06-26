@@ -5,9 +5,14 @@ package store
 
 import (
 	"context"
+	"errors"
 
 	"moonbridge/internal/config"
 )
+
+// ErrConfigNotSeeded reports an empty persistence store that has tables but no
+// persisted graph configuration yet.
+var ErrConfigNotSeeded = errors.New("config not seeded")
 
 // ReloadFunc is called by ApplyPendingChanges to apply a new configuration
 // after successful staging validation.
@@ -35,6 +40,12 @@ type ConfigStore interface {
 	// SeedFromConfig populates the main tables from a config.Config.
 	// Intended for first-time DB initialization.
 	SeedFromConfig(cfg *config.Config) error
+
+	// SaveConfig atomically replaces the persisted graph configuration.
+	SaveConfig(ctx context.Context, cfg *config.Config) (string, error)
+
+	// CurrentRevision returns the current persisted graph revision.
+	CurrentRevision() (string, error)
 
 	// ExportYAML serializes the current DB state as YAML bytes.
 	// If includeSecrets is false, API key values are masked.
@@ -80,16 +91,16 @@ type ModelRow struct {
 
 // RouteRow represents a row in the config_store_routes table.
 type RouteRow struct {
-	Alias            string
-	ModelSlug        string
-	ProviderKey      string
-	DisplayName      string
-	ContextWindow    int
-	MaxOutputTokens  int
-	Extensions       string // JSON-serialized map[string]config.ExtensionFileConfig
-	WebSearch        string // JSON-serialized config.WebSearchFileConfig
-	CreatedAt        string
-	UpdatedAt        string
+	Alias           string
+	ModelSlug       string
+	ProviderKey     string
+	DisplayName     string
+	ContextWindow   int
+	MaxOutputTokens int
+	Extensions      string // JSON-serialized map[string]config.ExtensionFileConfig
+	WebSearch       string // JSON-serialized config.WebSearchFileConfig
+	CreatedAt       string
+	UpdatedAt       string
 }
 
 // SettingRow represents a row in the config_store_settings table.
@@ -100,16 +111,16 @@ type SettingRow struct {
 
 // ChangeRow represents a row in the config_store_changes table.
 type ChangeRow struct {
-	ID         int64
-	BatchID    string
-	Action     string // "create", "update", "delete"
-	Resource   string // "provider", "offer", "model", "route", "setting"
-	TargetKey  string
-	Before     string // JSON-serialized "before" state (empty for create)
-	After      string // JSON-serialized "after" state (empty for delete)
-	Applied    bool
-	Error      string
-	Revision   int
-	CreatedAt  string
-	AppliedAt  string
+	ID        int64
+	BatchID   string
+	Action    string // "create", "update", "delete"
+	Resource  string // "provider", "offer", "model", "route", "setting"
+	TargetKey string
+	Before    string // JSON-serialized "before" state (empty for create)
+	After     string // JSON-serialized "after" state (empty for delete)
+	Applied   bool
+	Error     string
+	Revision  int
+	CreatedAt string
+	AppliedAt string
 }

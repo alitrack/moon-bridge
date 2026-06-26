@@ -188,7 +188,7 @@ func TestReloadWithInvalidConfigReturnsError(t *testing.T) {
 
 	// Reload with invalid mode (empty mode fails validation).
 	invalidCfg := config.Config{
-		Mode: config.Mode(""),
+		Mode:  config.Mode(""),
 		Cache: config.CacheConfig{Mode: "off"},
 	}
 
@@ -205,5 +205,40 @@ func TestReloadWithInvalidConfigReturnsError(t *testing.T) {
 	}
 	if snap != initialSnap {
 		t.Error("snapshot pointer changed after failed Reload")
+	}
+}
+
+func TestValidateCandidateDoesNotReplaceCurrentOnFailure(t *testing.T) {
+	valid := candidateRuntimeConfig()
+	rt := runtime.NewRuntime(valid, nil, nil)
+	before := rt.Current()
+
+	invalid := valid
+	invalid.Mode = config.Mode("invalid")
+
+	if err := rt.ValidateCandidate(invalid); err == nil {
+		t.Fatal("ValidateCandidate() error = nil")
+	}
+	if got := rt.Current(); got != before {
+		t.Fatal("runtime snapshot changed after failed candidate validation")
+	}
+}
+
+func candidateRuntimeConfig() config.Config {
+	return config.Config{
+		Mode:         config.ModeTransform,
+		Addr:         "127.0.0.1:38440",
+		DefaultModel: "test-model",
+		Routes: map[string]config.RouteEntry{
+			"test": {Provider: "default", Model: "claude-test"},
+		},
+		ProviderDefs: map[string]config.ProviderDef{
+			"default": {
+				BaseURL: "https://api.anthropic.test",
+				APIKey:  "test-key",
+				Models:  map[string]config.ModelMeta{"claude-test": {ContextWindow: 100000}},
+			},
+		},
+		Cache: config.CacheConfig{Mode: "off"},
 	}
 }

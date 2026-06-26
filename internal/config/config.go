@@ -20,8 +20,8 @@ const (
 	ProtocolAnthropic      = "anthropic"
 	ProtocolOpenAIResponse = "openai-response"
 	// Phase 5: New protocol constants (D-08)
-	ProtocolGoogleGenAI    = "google-genai"
-	ProtocolOpenAIChat     = "openai-chat"
+	ProtocolGoogleGenAI = "google-genai"
+	ProtocolOpenAIChat  = "openai-chat"
 )
 
 type Mode string
@@ -48,25 +48,27 @@ type WebSearchConfig struct {
 	TavilyAPIKey    string
 	FirecrawlAPIKey string
 	SearchMaxRounds int
+	Extra           map[string]any
 }
 
 type Config struct {
-	Mode              Mode
-	Addr              string
-	AuthToken         string
-	TraceRequests     bool
-	LogLevel          string
-	LogFormat         string
-	SystemPrompt      string
-	DefaultModel      string
-	WebSearchSupport  WebSearchSupport
-	WebSearchMaxUses  int
-	TavilyAPIKey      string
-	FirecrawlAPIKey   string
-	SearchMaxRounds   int
-	DefaultMaxTokens  int
-	MaxSessions int    `yaml:"max_sessions"`  // 0 = unlimited
-	SessionTTL  string `yaml:"session_ttl"`   // default "24h"
+	Mode             Mode
+	Addr             string
+	AuthToken        string
+	TraceRequests    bool
+	LogLevel         string
+	LogFormat        string
+	SystemPrompt     string
+	DefaultModel     string
+	WebSearchSupport WebSearchSupport
+	WebSearchMaxUses int
+	TavilyAPIKey     string
+	FirecrawlAPIKey  string
+	SearchMaxRounds  int
+	WebSearchExtra   map[string]any
+	DefaultMaxTokens int
+	MaxSessions      int    `yaml:"max_sessions"` // 0 = unlimited
+	SessionTTL       string `yaml:"session_ttl"`  // default "24h"
 	// Defaults holds the default configuration values.
 	Defaults Defaults
 	// Models is the canonical model definition map (shared across providers).
@@ -78,6 +80,7 @@ type Config struct {
 	Persistence    PersistenceConfig
 	ResponseProxy  ResponseProxyConfig
 	AnthropicProxy AnthropicProxyConfig
+	EgressProxy    string
 	Extensions     map[string]ExtensionSettings
 
 	extensionSpecs extensionSpecIndex
@@ -98,6 +101,7 @@ type RouteEntry struct {
 	Description string
 	// BaseInstructions overrides the default model instructions for the catalog.
 	BaseInstructions           string
+	SupportsReasoning          bool
 	DefaultReasoningLevel      string
 	SupportedReasoningLevels   []ReasoningLevelPreset
 	SupportsReasoningSummaries bool
@@ -115,11 +119,11 @@ type RouteEntry struct {
 
 // ProviderDef defines a single upstream provider.
 type ProviderDef struct {
-	BaseURL          string
-	APIKey           string
-	Version          string
-	UserAgent        string
-	Protocol         string // "anthropic" (default), "openai-response", "google-genai", or "openai-chat"
+	BaseURL   string
+	APIKey    string
+	Version   string
+	UserAgent string
+	Protocol  string // "anthropic" (default), "openai-response", "google-genai", or "openai-chat"
 	// Phase 5: Google GenAI flat fields (D-09).
 	// Only relevant when Protocol == ProtocolGoogleGenAI.
 	// project: Google Cloud project ID (Vertex AI).
@@ -129,12 +133,13 @@ type ProviderDef struct {
 	Location   string `yaml:"location,omitempty"`
 	APIVersion string `yaml:"api_version,omitempty"`
 	// Cache config for this provider. If nil, provider does not use caching.
-	Cache *CacheConfig `yaml:"cache,omitempty"`
+	Cache            *CacheConfig `yaml:"cache,omitempty"`
 	WebSearchSupport WebSearchSupport
 	WebSearchMaxUses int
 	TavilyAPIKey     string
 	FirecrawlAPIKey  string
 	SearchMaxRounds  int
+	WebSearchExtra   map[string]any
 	Extensions       map[string]ExtensionSettings
 	// Models is the provider's model catalog: upstream model name -> metadata.
 	Models map[string]ModelMeta
@@ -155,6 +160,7 @@ type ModelMeta struct {
 	Description string
 	// BaseInstructions overrides the default model instructions for the catalog.
 	BaseInstructions           string
+	SupportsReasoning          bool
 	DefaultReasoningLevel      string
 	SupportedReasoningLevels   []ReasoningLevelPreset
 	SupportsReasoningSummaries bool
@@ -192,6 +198,7 @@ type ModelDef struct {
 	DisplayName                 string
 	Description                 string
 	BaseInstructions            string
+	SupportsReasoning           bool
 	DefaultReasoningLevel       string
 	SupportedReasoningLevels    []ReasoningLevelPreset
 	SupportsReasoningSummaries  bool
@@ -204,11 +211,11 @@ type ModelDef struct {
 
 // OfferEntry declares that a provider offers a model defined in Models.
 type OfferEntry struct {
-	Model        string      // references models.<slug>
-	UpstreamName string      // optional, upstream model name (empty = same as slug)
-	Priority     int         // lower value = higher priority (0 is highest)
+	Model        string // references models.<slug>
+	UpstreamName string // optional, upstream model name (empty = same as slug)
+	Priority     int    // lower value = higher priority (0 is highest)
 	Pricing      ModelPricing
-	Overrides    *ModelDef   // optional provider-specific overrides
+	Overrides    *ModelDef // optional provider-specific overrides
 }
 
 type ResponseProxyConfig struct {
@@ -413,6 +420,7 @@ func (cfg Config) RouteFor(model string) RouteEntry {
 				entry.CacheReadPrice = meta.CacheReadPrice
 				entry.DisplayName = meta.DisplayName
 				entry.Description = meta.Description
+				entry.SupportsReasoning = meta.SupportsReasoning
 				entry.DefaultReasoningLevel = meta.DefaultReasoningLevel
 				entry.SupportedReasoningLevels = meta.SupportedReasoningLevels
 				entry.SupportsReasoningSummaries = meta.SupportsReasoningSummaries

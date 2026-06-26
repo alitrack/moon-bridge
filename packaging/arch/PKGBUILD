@@ -1,0 +1,61 @@
+# Maintainer: Moon Bridge local package
+pkgname=moon-bridge
+pkgver=0.1.0
+pkgrel=5
+pkgdesc='Protocol conversion and model routing proxy for OpenAI Responses-compatible clients'
+arch=('x86_64')
+url='https://github.com/moon-bridge/moon-bridge'
+license=('GPL-3.0-only')
+depends=('glibc')
+makedepends=('go' 'npm')
+install="${pkgname}.install"
+source=(
+  "${pkgname}-${pkgver}.tar.gz"
+  "config.local.yml"
+)
+sha256sums=('SKIP' 'SKIP')
+
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+
+  export CGO_ENABLED=0
+  export GOCACHE="${srcdir}/go-build"
+  export GOMODCACHE="${srcdir}/go-mod"
+  export GOFLAGS="-modcacherw"
+  export npm_config_cache="${srcdir}/npm-cache"
+  export npm_config_legacy_peer_deps=true
+
+  npm --prefix webui ci
+  npm --prefix webui run build
+
+  rm -rf internal/service/webui/dist
+  mkdir -p internal/service/webui/dist
+  cp -R webui/dist/. internal/service/webui/dist/
+
+  go build -buildvcs=false -trimpath -ldflags="-s -w" -o moonbridge ./cmd/moonbridge
+}
+
+check() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+
+  export CGO_ENABLED=0
+  export GOCACHE="${srcdir}/go-build"
+  export GOMODCACHE="${srcdir}/go-mod"
+  export GOFLAGS="-modcacherw"
+  export npm_config_cache="${srcdir}/npm-cache"
+  export npm_config_legacy_peer_deps=true
+
+  npm --prefix webui test
+  go test ./...
+  ./moonbridge -config "${srcdir}/config.local.yml" -print-addr
+}
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+
+  install -Dm755 moonbridge "${pkgdir}/usr/bin/moonbridge"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 config.example.yml "${pkgdir}/usr/share/doc/${pkgname}/config.example.yml"
+  install -Dm644 "${srcdir}/config.local.yml" "${pkgdir}/usr/share/doc/${pkgname}/config.local.yml"
+}

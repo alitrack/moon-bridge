@@ -6,19 +6,19 @@ import (
 
 	circuitbreaker "moonbridge/internal/extension/circuit_breaker"
 	contextmanager "moonbridge/internal/extension/context_manager"
+	"moonbridge/internal/config"
+	codextoolproxy "moonbridge/internal/extension/codex_tool_proxy"
 	dbd1 "moonbridge/internal/extension/db/d1"
 	dbsqlite "moonbridge/internal/extension/db/sqlite"
 	deepseekv4 "moonbridge/internal/extension/deepseek_v4"
 	kimiworkaround "moonbridge/internal/extension/kimi_workaround"
 	mbtrics "moonbridge/internal/extension/metrics"
-	codextoolproxy "moonbridge/internal/extension/codex_tool_proxy"
 	"moonbridge/internal/extension/plugin"
 	responsestore "moonbridge/internal/extension/response_store"
 	sessionrecorder "moonbridge/internal/extension/session_recorder"
 	skillinjector "moonbridge/internal/extension/skill_injector"
 	"moonbridge/internal/extension/visual"
 	webfetch "moonbridge/internal/extension/web_fetch"
-	"moonbridge/internal/config"
 )
 
 // ExtensionOptions controls optional initialization of built-in plugins.

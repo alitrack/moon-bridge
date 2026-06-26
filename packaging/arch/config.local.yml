@@ -1,0 +1,49 @@
+mode: "Transform"
+
+log:
+  level: "info"
+  format: "text"
+
+server:
+  addr: "127.0.0.1:38440"
+
+persistence:
+  active_provider: db_sqlite
+
+extensions:
+  db_sqlite:
+    enabled: true
+    config:
+      path: ./data/moonbridge.db
+      wal: true
+      busy_timeout_ms: 5000
+      max_open_conns: 1
+
+cache:
+  mode: "off"
+
+defaults:
+  model: "moonbridge"
+  max_tokens: 1024
+
+models:
+  local-test-model:
+    context_window: 128000
+    max_output_tokens: 4096
+    display_name: "Local Test Model"
+    description: "Minimal local configuration placeholder. Replace provider credentials before sending real requests."
+
+providers:
+  local:
+    base_url: "https://api.example.invalid"
+    api_key: "replace-with-real-api-key"
+    protocol: "openai-chat"
+    user_agent: "moonbridge/1.0"
+    offers:
+      - model: local-test-model
+        upstream_name: "replace-with-upstream-model"
+
+routes:
+  moonbridge:
+    model: "replace-with-upstream-model"
+    provider: "local"

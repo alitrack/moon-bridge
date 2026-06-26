@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"moonbridge/internal/extension/codextool"
 	"moonbridge/internal/format"
 )
 
@@ -47,8 +48,14 @@ type AnthropicProviderAdapter struct {
 	cacheMgr     CacheManager
 	hooks        format.CorePluginHooks
 
-	streamMu     sync.Mutex
-	streamEvents []StreamEvent
+	// cacheKeyMu guards cacheKeyStore, which maps context pointers to cache
+	// key/ttl pairs computed during PlanAndInject and consumed during ToCoreResponse.
+	cacheKeyMu    sync.Mutex
+	cacheKeyStore map[string]cacheKeyEntry
+}
+
+type cacheKeyEntry struct {
+	key, ttl string
 }
 
 // NewAnthropicProviderAdapter creates a new AnthropicProviderAdapter.
@@ -57,9 +64,10 @@ type AnthropicProviderAdapter struct {
 // if caching is not needed.
 func NewAnthropicProviderAdapter(cfgMaxTokens int, cacheMgr CacheManager, hooks format.CorePluginHooks) *AnthropicProviderAdapter {
 	return &AnthropicProviderAdapter{
-		cfgMaxTokens: cfgMaxTokens,
-		cacheMgr:     cacheMgr,
-		hooks:        hooks.WithDefaults(),
+		cfgMaxTokens:  cfgMaxTokens,
+		cacheMgr:      cacheMgr,
+		hooks:         hooks.WithDefaults(),
+		cacheKeyStore: make(map[string]cacheKeyEntry),
 	}
 }
 
@@ -294,6 +302,11 @@ func (a *AnthropicProviderAdapter) FromCoreRequest(ctx context.Context, req *for
 			Role:    a.mapRole(msg.Role),
 			Content: a.toContentBlocks(msg.Content),
 		}
+		// Skip messages with no content blocks — they are empty and contribute
+		// no semantic value to the upstream API.
+		if len(anthroMsg.Content) == 0 {
+			continue
+		}
 		last := len(anthropicReq.Messages) - 1
 		if last >= 0 && anthroMsg.Role == "user" &&
 			anthropicReq.Messages[last].Role == "user" &&
@@ -304,6 +317,15 @@ func (a *AnthropicProviderAdapter) FromCoreRequest(ctx context.Context, req *for
 		} else {
 			anthropicReq.Messages = append(anthropicReq.Messages, anthroMsg)
 		}
+	}
+
+	// Ensure first message has role "user" — Anthropic API rejects requests
+	// where the first message is assistant, tool, or any non-user role.
+	if len(anthropicReq.Messages) > 0 && anthropicReq.Messages[0].Role != "user" {
+		anthropicReq.Messages = append(
+			[]Message{{Role: "user", Content: []ContentBlock{{Type: "text", Text: "_"}}}},
+			anthropicReq.Messages...,
+		)
 	}
 
 	// Tools
@@ -335,7 +357,13 @@ func (a *AnthropicProviderAdapter) FromCoreRequest(ctx context.Context, req *for
 	// Step 3: Cache planning via CacheManager.
 	// PlanAndInject may modify anthropicReq in-place by setting cache_control
 	// on tools, system blocks, messages, or the request-level field.
-	a.cacheMgr.PlanAndInject(ctx, &anthropicReq, req)
+	key, ttl := a.cacheMgr.PlanAndInject(ctx, &anthropicReq, req)
+
+	// Store cache key/ttl for retrieval in ToCoreResponse.
+	ctxKey := fmt.Sprintf("%p", ctx)
+	a.cacheKeyMu.Lock()
+	a.cacheKeyStore[ctxKey] = cacheKeyEntry{key: key, ttl: ttl}
+	a.cacheKeyMu.Unlock()
 
 	return &anthropicReq, nil
 }
@@ -349,6 +377,10 @@ func (a *AnthropicProviderAdapter) FromCoreRequest(ctx context.Context, req *for
 // The response content blocks become a single assistant message. Cache registry
 // is updated from usage signals via CacheManager.
 func (a *AnthropicProviderAdapter) ToCoreResponse(ctx context.Context, resp any) (*format.CoreResponse, error) {
+	return a.ToCoreResponseWithRequest(ctx, nil, resp)
+}
+
+func (a *AnthropicProviderAdapter) ToCoreResponseWithRequest(ctx context.Context, req *format.CoreRequest, resp any) (*format.CoreResponse, error) {
 	msgResp, err := normalizeAnthropicMessageResponse(resp)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic adapter: %w", err)
@@ -360,6 +392,12 @@ func (a *AnthropicProviderAdapter) ToCoreResponse(ctx context.Context, resp any)
 
 	// Convert content blocks to Core message.
 	coreContent := a.fromContentBlocks(msgResp.Content)
+	if req != nil {
+		toolMap := codextool.DecodeToolMapFromExtensions(req.Extensions)
+		for i := range coreContent {
+			codextool.DecodeCoreToolBlockFromProvider(&coreContent[i], toolMap)
+		}
+	}
 
 	coreResp := &format.CoreResponse{
 		ID:     msgResp.ID,
@@ -386,10 +424,19 @@ func (a *AnthropicProviderAdapter) ToCoreResponse(ctx context.Context, resp any)
 	}
 
 	// Update cache registry from usage signals via CacheManager.
-	// The key/ttl were computed during PlanAndInject and must be accessible
-	// through the CacheManager's own state (or context).
+	// The key/ttl were computed during PlanAndInject and are retrieved
+	// from the per-request cache key store.
 	if a.cacheMgr != nil {
-		a.cacheMgr.UpdateRegistry(ctx, "", "", msgResp.Usage)
+		ctxKey := fmt.Sprintf("%p", ctx)
+		a.cacheKeyMu.Lock()
+		entry, ok := a.cacheKeyStore[ctxKey]
+		delete(a.cacheKeyStore, ctxKey)
+		a.cacheKeyMu.Unlock()
+		if ok {
+			a.cacheMgr.UpdateRegistry(ctx, entry.key, entry.ttl, msgResp.Usage)
+		} else {
+			a.cacheMgr.UpdateRegistry(ctx, "", "", msgResp.Usage)
+		}
 	}
 
 	return coreResp, nil
@@ -422,15 +469,18 @@ type streamConverterState struct {
 	blockTypes      map[int]string            // content index → block type
 	blockSignatures map[int]string            // content index → reasoning signature (from signature_delta)
 	finalUsage      *format.CoreUsage         // tracked from message_delta, passed to message_stop
-	adapter         *AnthropicProviderAdapter // for buffering raw stream events (trace)
+	adapter         *AnthropicProviderAdapter // for plugin hooks
 	suppressText    map[int]bool              // text indices to suppress (server-side search status, etc.)
+	buf             *[]StreamEvent            // per-stream event buffer (local, not shared)
+	bufMu           *sync.Mutex               // guards buf
+	ctx             context.Context           // for context-aware channel sends
 }
 
 // ToCoreStream consumes an anthropic.Stream and returns a channel of CoreStreamEvent.
 //
 // The adapter owns the read-loop goroutine. The returned channel is closed when
 // the stream ends, context is cancelled, or an error occurs.
-func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (<-chan format.CoreStreamEvent, error) {
+func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (*format.StreamResult, error) {
 	stream, ok := src.(Stream)
 	if !ok {
 		return nil, fmt.Errorf("anthropic adapter: expected anthropic.Stream, got %T", src)
@@ -438,13 +488,14 @@ func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (<
 	ctx = coreHookContext(ctx, "")
 	events := make(chan format.CoreStreamEvent, 64)
 
-	// Initialize stream event buffer for trace capture.
-	a.streamMu.Lock()
-	a.streamEvents = make([]StreamEvent, 0, 64)
-	a.streamMu.Unlock()
+	// Per-stream buffer — local to this call, not shared across concurrent requests.
+	var buf []StreamEvent
+	var bufMu sync.Mutex
+	bufReady := make(chan struct{})
 
 	go func() {
 		defer close(events)
+		defer close(bufReady)
 		defer stream.Close()
 
 		state := &streamConverterState{
@@ -452,6 +503,9 @@ func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (<
 			blockSignatures: make(map[int]string),
 			adapter:         a,
 			suppressText:    make(map[int]bool),
+			buf:             &buf,
+			bufMu:           &bufMu,
+			ctx:             ctx,
 		}
 
 		for {
@@ -464,10 +518,8 @@ func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (<
 			ev, err := stream.Next()
 			if err != nil {
 				if err == io.EOF {
-					// Stream ended normally.
 					return
 				}
-				// Context cancellation is clean shutdown, not a failure.
 				if err == context.Canceled || err == context.DeadlineExceeded {
 					return
 				}
@@ -480,11 +532,30 @@ func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (<
 				return
 			}
 
+			// Check context immediately after Next() to close the race window.
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			state.convertEvent(events, ev)
 		}
 	}()
 
-	return events, nil
+	return &format.StreamResult{
+		Events: events,
+		StreamBuffer: func() []any {
+			<-bufReady
+			bufMu.Lock()
+			defer bufMu.Unlock()
+			result := make([]any, len(buf))
+			for i, ev := range buf {
+				result[i] = ev
+			}
+			return result
+		},
+	}, nil
 }
 
 // =========================================================================
@@ -498,13 +569,24 @@ func (s *streamConverterState) nextSeq() int64 {
 
 func (s *streamConverterState) emit(events chan<- format.CoreStreamEvent, ev format.CoreStreamEvent) {
 	ev.SeqNum = s.nextSeq()
-	events <- ev
+	if s.ctx != nil {
+		select {
+		case <-s.ctx.Done():
+		case events <- ev:
+		}
+	} else {
+		events <- ev
+	}
 }
 
 func (s *streamConverterState) convertEvent(events chan<- format.CoreStreamEvent, ev StreamEvent) {
-	// Buffer the original event for trace (max 4MB).
-	if s.adapter != nil {
-		s.adapter.bufferStreamEvent(ev)
+	// Buffer the original event for trace in the per-stream local buffer.
+	if s.bufMu != nil && s.buf != nil {
+		s.bufMu.Lock()
+		if len(*s.buf) < 1024 {
+			*s.buf = append(*s.buf, ev)
+		}
+		s.bufMu.Unlock()
 	}
 	switch ev.Type {
 	case "message_start":
@@ -743,7 +825,7 @@ func (a *AnthropicProviderAdapter) toContentBlock(b format.CoreContentBlock) Con
 		}
 
 	case "tool_result":
-		var content any
+		var content any = ""
 		if len(b.ToolResultContent) > 0 {
 			content = a.toContentBlocks(b.ToolResultContent)
 		}
@@ -971,20 +1053,168 @@ func (a *AnthropicProviderAdapter) mapStopReasonToStatus(reason string) string {
 // bufferStreamEvent buffers the raw anthropic stream event for trace capture,
 // up to the 4MB limit. The event is JSON-marshalled to estimate its size.
 func (a *AnthropicProviderAdapter) bufferStreamEvent(ev StreamEvent) {
-	a.streamMu.Lock()
-	defer a.streamMu.Unlock()
-	// Cap buffer at 1024 events (~4MB estimation) to prevent unbounded memory growth.
-	if len(a.streamEvents) >= 1024 {
-		return
+	// streamConverterState captures buf/bufMu from the goroutine closure.
+	// This is a no-op without a per-stream buffer — use the state.bufferStreamEvent instead.
+}
+
+// flattenSchemaComposition detects composition keywords (oneOf/allOf/anyOf) at
+// the top level of the schema and flattens them into a merged object schema.
+// Returns the flattened schema, or nil if the schema does not need flattening.
+//
+// Each composition branch must itself be an object schema with properties.
+// Properties are merged across all branches by name. The "action" property's
+// enum values across all branches are combined into a single enum list.
+//
+// Example input:
+//
+//	{"type": "object", "oneOf": [
+//	  {"properties": {"action": {"enum": ["a"]}, "x": {}}, "required": ["action","x"]},
+//	  {"properties": {"action": {"enum": ["b"]}, "y": {}}, "required": ["action","y"]}
+//	]}
+//
+// Example output:
+//
+//	{"type": "object", "properties": {
+//	  "action": {"type": "string", "enum": ["a","b"]},
+//	  "x": {},
+//	  "y": {}
+//	}, "additionalProperties": false}
+func flattenSchemaComposition(schema map[string]any) map[string]any {
+	compositionKey := detectCompositionKeyword(schema)
+	if compositionKey == "" {
+		return nil
 	}
-	a.streamEvents = append(a.streamEvents, ev)
+
+	branchesRaw, ok := schema[compositionKey]
+	if !ok {
+		return nil
+	}
+
+	branches, ok := schemaCompositionBranches(branchesRaw)
+	if !ok {
+		return nil
+	}
+	if len(branches) == 0 {
+		return nil
+	}
+
+	// Merge properties across all branches.
+	mergedProperties := make(map[string]any)
+	var actionEnumValues []any
+	seenActionValues := make(map[string]bool)
+	hasAdditionalPropsRestriction := false
+
+	for _, branch := range branches {
+		if props, ok := branch["properties"].(map[string]any); ok {
+			for propName, propSchema := range props {
+				if propName == "action" {
+					// Merge action enum values across all branches.
+					if propMap, ok := propSchema.(map[string]any); ok {
+						for _, val := range schemaEnumValues(propMap["enum"]) {
+							valStr, ok := val.(string)
+							if !ok {
+								continue
+							}
+							if !seenActionValues[valStr] {
+								seenActionValues[valStr] = true
+								actionEnumValues = append(actionEnumValues, val)
+							}
+						}
+					}
+				}
+				// First definition wins (earlier branches take priority).
+				if _, exists := mergedProperties[propName]; !exists {
+					mergedProperties[propName] = propSchema
+				}
+			}
+		}
+
+		// Track if any branch sets additionalProperties.
+		if _, ok := branch["additionalProperties"]; ok {
+			hasAdditionalPropsRestriction = true
+		}
+	}
+
+	// Build flattened schema: preserve all non-composition keys from original.
+	flattened := make(map[string]any)
+	for k, v := range schema {
+		if k == compositionKey || k == "properties" {
+			continue
+		}
+		flattened[k] = v
+	}
+	flattened["type"] = "object"
+
+	// If there's a merged "action" enum, build the action property.
+	if len(actionEnumValues) > 0 {
+		actionSchema := map[string]any{"type": "string", "enum": actionEnumValues}
+		mergedProperties["action"] = actionSchema
+	}
+
+	if len(mergedProperties) > 0 {
+		flattened["properties"] = mergedProperties
+	}
+
+	// Remove "required" — different actions require different fields.
+	delete(flattened, "required")
+
+	if hasAdditionalPropsRestriction {
+		flattened["additionalProperties"] = false
+	}
+
+	return flattened
+}
+
+func schemaCompositionBranches(raw any) ([]map[string]any, bool) {
+	switch branches := raw.(type) {
+	case []map[string]any:
+		return branches, true
+	case []any:
+		result := make([]map[string]any, 0, len(branches))
+		for _, branchRaw := range branches {
+			branch, ok := branchRaw.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			result = append(result, branch)
+		}
+		return result, true
+	default:
+		return nil, false
+	}
+}
+
+func schemaEnumValues(raw any) []any {
+	switch values := raw.(type) {
+	case []any:
+		return values
+	case []string:
+		result := make([]any, 0, len(values))
+		for _, value := range values {
+			result = append(result, value)
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+// detectCompositionKeyword checks if the schema has oneOf, allOf, or anyOf
+// at the top level and returns the keyword name. Returns empty string if none.
+func detectCompositionKeyword(schema map[string]any) string {
+	for _, kw := range []string{"oneOf", "allOf", "anyOf"} {
+		if _, ok := schema[kw]; ok {
+			return kw
+		}
+	}
+	return ""
 }
 
 // StreamBuffer returns the buffered stream events for trace capture.
 func (a *AnthropicProviderAdapter) StreamBuffer() []StreamEvent {
-	a.streamMu.Lock()
-	defer a.streamMu.Unlock()
-	return a.streamEvents
+	// Deprecated: use StreamResult.StreamBuffer instead.
+	// This method will be removed after all callers migrate.
+	return nil
 }
 
 // RememberStreamContent stores response content from a stream for plugin state tracking.
@@ -1047,10 +1277,22 @@ func (a *AnthropicProviderAdapter) coreCacheControl(c *format.CoreCacheControl) 
 // Empty maps are preserved as-is (e.g. properties:{}) to avoid corrupting
 // the JSON Schema structure. Returns nil when the entire result is empty;
 // callers must supply a {"type":"object"} fallback when needed.
+//
+// Also flattens JSON Schema composition keywords (oneOf / allOf / anyOf) from
+// the top level into a merged properties object. AWS Bedrock rejects
+// input_schema that has these keywords at the root level.
 func cleanSchema(schema map[string]any) map[string]any {
 	if schema == nil {
 		return nil
 	}
+
+	// Flatten composition keywords (oneOf/allOf/anyOf) at the top level.
+	// AWS Bedrock rejects these at the input_schema root even when
+	// "type":"object" is also present.
+	if flattened := flattenSchemaComposition(schema); flattened != nil {
+		return flattened
+	}
+
 	result := make(map[string]any, len(schema))
 	for k, v := range schema {
 		switch val := v.(type) {

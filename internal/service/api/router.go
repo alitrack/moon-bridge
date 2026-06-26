@@ -57,10 +57,9 @@ func NewRouter(cfg ConfigStore, rt *runtime.Runtime, st *stats.SessionStats, reg
 	mux := http.NewServeMux()
 
 	// Auth middleware for all API routes.
-	// Store check disabled — store-dependent routes are conditionally registered.
 	authMW := AuthMiddleware(func() string {
 		return r.server.CurrentConfig().AuthToken()
-	}, nil)
+	}, func() bool { return r.store != nil })
 
 	// Register all routes using Go 1.22+ pattern matching.
 	registerRoutes(mux, r)
@@ -106,11 +105,16 @@ func registerRoutes(mux *http.ServeMux, r *Router) {
 		mux.HandleFunc("GET /extensions/{name}", r.handleGetExtension)
 		mux.HandleFunc("PUT /extensions/{name}", r.handlePutExtension)
 
-		// Config endpoints
-		mux.HandleFunc("GET /config/effective", r.handleGetConfigEffective)
-		mux.HandleFunc("GET /config/export", r.handleGetConfigExport)
-		mux.HandleFunc("POST /config/import", r.handlePostConfigImport)
-		mux.HandleFunc("POST /config/validate", r.handlePostConfigValidate)
+	// Config endpoints
+	mux.HandleFunc("GET /config/graph", r.handleGetConfigGraph)
+	mux.HandleFunc("PATCH /config/graph", r.handlePatchConfigGraph)
+	mux.HandleFunc("POST /config/graph/validate", r.handleValidateConfigGraph)
+	mux.HandleFunc("POST /config/resources/{kind}", r.handleCreateConfigResource)
+	mux.HandleFunc("DELETE /config/resources/{kind}/{id}", r.handleDeleteConfigResource)
+	mux.HandleFunc("GET /config/effective", r.handleGetConfigEffective)
+	mux.HandleFunc("GET /config/export", r.handleGetConfigExport)
+	mux.HandleFunc("POST /config/import", r.handlePostConfigImport)
+	mux.HandleFunc("POST /config/validate", r.handlePostConfigValidate)
 
 		// Changes endpoints
 		mux.HandleFunc("GET /changes", r.handleListChanges)
@@ -124,7 +128,10 @@ func registerRoutes(mux *http.ServeMux, r *Router) {
 	mux.HandleFunc("GET /sessions", r.handleGetSessions)
 	mux.HandleFunc("GET /stats", r.handleGetStats)
 	mux.HandleFunc("GET /stats/summary", r.handleGetStatsSummary)
+	mux.HandleFunc("GET /stats/usage", r.handleGetStatsUsage)
 	mux.HandleFunc("GET /logs", r.handleGetLogs)
+	mux.HandleFunc("GET /logs/recent", r.handleGetLogsRecent)
+	mux.HandleFunc("GET /logs/stream", r.handleGetLogsStream)
 	mux.HandleFunc("GET /version", r.handleGetVersion)
 
 	// Runtime mode switch (always available).

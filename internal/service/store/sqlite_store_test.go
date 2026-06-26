@@ -218,7 +218,117 @@ func TestSQLiteStoreStageAndDiscardChanges(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreSaveConfigOverwritesCurrentConfig(t *testing.T) {
+	cs := newConfigStoreForTest(t)
+	initial := buildTestConfig()
+	if err := cs.SeedFromConfig(initial); err != nil {
+		t.Fatalf("SeedFromConfig() error = %v", err)
+	}
+	revBefore, err := cs.CurrentRevision()
+	if err != nil {
+		t.Fatalf("CurrentRevision() before save error = %v", err)
+	}
+	if revBefore == "" {
+		t.Fatal("CurrentRevision() before save returned empty revision")
+	}
+
+	next := buildSavedGraphConfig()
+	revAfter, err := cs.SaveConfig(context.Background(), next)
+	if err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+	if revAfter == "" {
+		t.Fatal("SaveConfig() returned empty revision")
+	}
+	if revAfter == revBefore {
+		t.Fatalf("SaveConfig() revision = %q, want different from %q", revAfter, revBefore)
+	}
+
+	stored, err := cs.LoadAll()
+	if err != nil {
+		t.Fatalf("LoadAll() after SaveConfig error = %v", err)
+	}
+	if stored.Defaults.MaxTokens != 8192 {
+		t.Fatalf("Defaults.MaxTokens = %d, want 8192", stored.Defaults.MaxTokens)
+	}
+	if _, ok := stored.ProviderDefs["anthropic"]; ok {
+		t.Fatal("old provider anthropic still exists after direct save")
+	}
+	if _, ok := stored.Routes["moonbridge"]; ok {
+		t.Fatal("old route moonbridge still exists after direct save")
+	}
+	if _, ok := stored.ProviderDefs["openai"]; !ok {
+		t.Fatal("new provider openai missing after direct save")
+	}
+	if _, ok := stored.Routes["saved"]; !ok {
+		t.Fatal("new route saved missing after direct save")
+	}
+
+	stableRevision, err := cs.CurrentRevision()
+	if err != nil {
+		t.Fatalf("CurrentRevision() after load error = %v", err)
+	}
+	if stableRevision != revAfter {
+		t.Fatalf("CurrentRevision() = %q, want SaveConfig revision %q", stableRevision, revAfter)
+	}
+}
+
+func TestSQLiteStoreSaveConfigRejectsInvalidConfigWithoutChangingStoredConfig(t *testing.T) {
+	cs := newConfigStoreForTest(t)
+	initial := buildTestConfig()
+	if err := cs.SeedFromConfig(initial); err != nil {
+		t.Fatalf("SeedFromConfig() error = %v", err)
+	}
+	revBefore, err := cs.CurrentRevision()
+	if err != nil {
+		t.Fatalf("CurrentRevision() before failed save error = %v", err)
+	}
+
+	invalid := buildSavedGraphConfig()
+	invalid.Mode = config.Mode("invalid")
+	if _, err := cs.SaveConfig(context.Background(), invalid); err == nil {
+		t.Fatal("SaveConfig() error = nil for invalid config")
+	}
+
+	stored, err := cs.LoadAll()
+	if err != nil {
+		t.Fatalf("LoadAll() after failed SaveConfig error = %v", err)
+	}
+	if stored.Mode != initial.Mode {
+		t.Fatalf("Mode = %q, want original %q", stored.Mode, initial.Mode)
+	}
+	if stored.Defaults.MaxTokens != initial.Defaults.MaxTokens {
+		t.Fatalf("Defaults.MaxTokens = %d, want original %d", stored.Defaults.MaxTokens, initial.Defaults.MaxTokens)
+	}
+	if _, ok := stored.ProviderDefs["anthropic"]; !ok {
+		t.Fatal("original provider anthropic missing after failed SaveConfig")
+	}
+
+	revAfter, err := cs.CurrentRevision()
+	if err != nil {
+		t.Fatalf("CurrentRevision() after failed save error = %v", err)
+	}
+	if revAfter != revBefore {
+		t.Fatalf("CurrentRevision() after failed save = %q, want unchanged %q", revAfter, revBefore)
+	}
+}
+
 // --- helpers ---
+
+func newConfigStoreForTest(t *testing.T) store.ConfigStore {
+	t.Helper()
+	logger := testLogger(t)
+	c := store.NewConfigStoreConsumer(logger)
+	ts := newTestStore(t, "config_store", c.Tables())
+	if err := c.BindStore(ts); err != nil {
+		t.Fatalf("BindStore() error = %v", err)
+	}
+	cs := c.Store()
+	if cs == nil {
+		t.Fatal("Store() returned nil")
+	}
+	return cs
+}
 
 func buildTestConfig() *config.Config {
 	return &config.Config{
@@ -301,6 +411,59 @@ func buildTestConfig() *config.Config {
 		},
 		ResponseProxy:  config.ResponseProxyConfig{},
 		AnthropicProxy: config.AnthropicProxyConfig{},
+	}
+}
+
+func buildSavedGraphConfig() *config.Config {
+	return &config.Config{
+		Mode:             config.ModeTransform,
+		Addr:             "127.0.0.1:38441",
+		AuthToken:        "saved-token",
+		MaxSessions:      7,
+		SessionTTL:       "12h",
+		TraceRequests:    false,
+		LogLevel:         "info",
+		LogFormat:        "text",
+		WebSearchSupport: config.WebSearchSupportDisabled,
+		WebSearchMaxUses: 4,
+		Defaults: config.Defaults{
+			Model:        "saved",
+			MaxTokens:    8192,
+			SystemPrompt: "Saved graph config",
+		},
+		Models: map[string]config.ModelDef{
+			"gpt-main": {
+				ContextWindow:   128000,
+				MaxOutputTokens: 16384,
+				DisplayName:     "GPT Main",
+			},
+		},
+		ProviderDefs: map[string]config.ProviderDef{
+			"openai": {
+				BaseURL:  "https://api.openai.com",
+				APIKey:   "sk-openai-saved-key",
+				Protocol: config.ProtocolOpenAIResponse,
+				Offers: []config.OfferEntry{
+					{
+						Model:        "gpt-main",
+						UpstreamName: "gpt-4.1",
+						Priority:     2,
+						Pricing: config.ModelPricing{
+							InputPrice:  2.0,
+							OutputPrice: 8.0,
+						},
+					},
+				},
+			},
+		},
+		Routes: map[string]config.RouteEntry{
+			"saved": {
+				Provider:    "openai",
+				Model:       "gpt-main",
+				DisplayName: "Saved Route",
+			},
+		},
+		Cache: config.CacheConfig{Mode: "off"},
 	}
 }
 

@@ -1,4 +1,4 @@
-.PHONY: test cover cover-html cover-check build release clean
+.PHONY: test cover cover-html cover-check build release clean webui-install webui-test webui-build build-with-webui
 
 COVERAGE_THRESHOLD := 95
 COVER_PROFILE := /tmp/moonbridge-coverage.out
@@ -10,6 +10,21 @@ LDFLAGS := -s -w
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
 build:
+	CGO_ENABLED=0 go build ./...
+
+webui-install:
+	npm --prefix webui install
+
+webui-test:
+	npm --prefix webui test
+
+webui-build:
+	npm --prefix webui run build
+	rm -rf internal/service/webui/dist
+	mkdir -p internal/service/webui/dist
+	cp -R webui/dist/. internal/service/webui/dist/
+
+build-with-webui: webui-build
 	CGO_ENABLED=0 go build ./...
 
 test:

@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 // It is referenced by the slog.Default() logger after Init. SetConsumeFunc operates
 // on this handler, and all derived sub-loggers share the same consumeState.
 var defaultHandler *consumeHandler
+var defaultRing *Ring
 
 // LogEntry represents a single log entry passed through the consume pipeline.
 type LogEntry struct {
@@ -26,6 +28,8 @@ type LogEntry struct {
 func init() {
 	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
 	defaultHandler = newConsumeHandler(h)
+	defaultRing = NewRing(1000)
+	defaultHandler.AddConsumeFunc(defaultRing.Consume)
 	slog.SetDefault(slog.New(defaultHandler))
 }
 
@@ -84,6 +88,8 @@ func Init(cfg Config) error {
 		inner = slog.NewTextHandler(out, opts)
 	}
 	defaultHandler = newConsumeHandler(inner)
+	defaultRing = NewRing(1000)
+	defaultHandler.AddConsumeFunc(defaultRing.Consume)
 	slog.SetDefault(slog.New(defaultHandler))
 	return nil
 }
@@ -95,4 +101,29 @@ func SetConsumeFunc(fn ConsumeFunc) {
 	if defaultHandler != nil {
 		defaultHandler.SetConsumeFunc(fn)
 	}
+}
+
+// AddConsumeFunc appends a consume callback to the current consume pipeline.
+func AddConsumeFunc(fn ConsumeFunc) {
+	if defaultHandler != nil {
+		defaultHandler.AddConsumeFunc(fn)
+	}
+}
+
+// Recent returns entries captured by the default log ring.
+func Recent(limit int) []LogEntry {
+	if defaultRing == nil {
+		return []LogEntry{}
+	}
+	return defaultRing.Recent(limit)
+}
+
+// Subscribe returns a channel of log entries from the default log ring.
+func Subscribe(ctx context.Context) <-chan LogEntry {
+	if defaultRing == nil {
+		ch := make(chan LogEntry)
+		close(ch)
+		return ch
+	}
+	return defaultRing.Subscribe(ctx)
 }

@@ -209,140 +209,100 @@ func (s *Store) Query(opts QueryOptions) ([]Record, error) {
 	return records, nil
 }
 
-// Summary holds aggregated metrics for a time range.
-type Summary struct {
-	PeriodStart      string             `json:"period_start"`
-	PeriodEnd        string             `json:"period_end"`
-	TotalRequests    int64              `json:"total_requests"`
-	TotalInputTokens int64              `json:"total_input_tokens"`
-	TotalOutputTokens int64             `json:"total_output_tokens"`
-	TotalCost        float64            `json:"total_cost"`
-	TotalDurationMs  int64              `json:"total_duration_ms"`
-	ByModel          []ModelSummary     `json:"by_model"`
-	ByProvider       []ProviderSummary  `json:"by_provider"`
+// UsageModelAggregate holds aggregated usage for one model over a window.
+type UsageModelAggregate struct {
+	Model         string
+	ActualModel   string
+	Requests      int64
+	InputTokens   int64
+	OutputTokens  int64
+	CacheCreation int64
+	CacheRead     int64
+	Cost          float64
 }
 
-// ModelSummary holds per-model aggregate metrics.
-type ModelSummary struct {
-	Model        string  `json:"model"`
-	ActualModel  string  `json:"actual_model,omitempty"`
-	Requests     int64   `json:"requests"`
-	InputTokens  int64   `json:"input_tokens"`
-	OutputTokens int64   `json:"output_tokens"`
-	Cost         float64 `json:"cost"`
-	AvgLatencyMs float64 `json:"avg_latency_ms"`
-	ErrorCount   int64   `json:"error_count"`
+// UsageAggregate holds aggregated usage totals plus per-model rows for a window.
+type UsageAggregate struct {
+	Requests      int64
+	InputTokens   int64
+	OutputTokens  int64
+	CacheCreation int64
+	CacheRead     int64
+	Cost          float64
+	Earliest      time.Time
+	Latest        time.Time
+	ByModel       []UsageModelAggregate
 }
 
-// ProviderSummary holds per-provider aggregate metrics.
-type ProviderSummary struct {
-	ProviderKey  string  `json:"provider_key"`
-	Requests     int64   `json:"requests"`
-	InputTokens  int64   `json:"input_tokens"`
-	OutputTokens int64   `json:"output_tokens"`
-	Cost         float64 `json:"cost"`
-}
-
-// SummaryOptions controls time range for summary queries.
-type SummaryOptions struct {
-	Since time.Time
-	Until time.Time
-}
-
-// Summary runs an aggregate query and returns a Summary.
-func (s *Store) Summary(opts SummaryOptions) (*Summary, error) {
+// AggregateUsage returns aggregated usage for the [since, until) window using
+// SQL aggregation. Zero Since/Until are treated as open bounds.
+func (s *Store) AggregateUsage(since, until time.Time) (UsageAggregate, error) {
+	var agg UsageAggregate
 	if s == nil || s.s == nil {
-		return nil, nil
+		return agg, nil
 	}
 	table, err := s.s.Table("request_metrics")
 	if err != nil {
-		return nil, err
+		return agg, err
 	}
 
-	since := opts.Since
-	until := opts.Until
-	if since.IsZero() {
-		since = time.Now().Truncate(24 * time.Hour)
+	var where []string
+	var args []any
+	if !since.IsZero() {
+		where = append(where, "timestamp >= ?")
+		args = append(args, since.UTC().Format(time.RFC3339Nano))
 	}
-	if until.IsZero() {
-		until = time.Now()
+	if !until.IsZero() {
+		where = append(where, "timestamp < ?")
+		args = append(args, until.UTC().Format(time.RFC3339Nano))
 	}
-
-	sinceStr := since.UTC().Format(time.RFC3339Nano)
-	untilStr := until.UTC().Format(time.RFC3339Nano)
-
-	// Overall totals (only success requests for token/cost counting).
-	totalQuery := fmt.Sprintf(
-		`SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-		        COALESCE(SUM(cost),0), COALESCE(SUM(response_time_ms),0)
-		 FROM %s WHERE timestamp >= ? AND timestamp < ? AND status = 'success'`,
-		table,
-	)
-	var totalReqs, totalIn, totalOut, totalDur int64
-	var totalCost float64
-	if err := s.s.QueryRowContext(context.Background(), totalQuery, sinceStr, untilStr).
-		Scan(&totalReqs, &totalIn, &totalOut, &totalCost, &totalDur); err != nil {
-		return nil, fmt.Errorf("summary totals: %w", err)
+	whereSQL := ""
+	if len(where) > 0 {
+		whereSQL = " WHERE " + joinClauses(where)
 	}
 
-	// Per-model breakdown.
-	modelQuery := fmt.Sprintf(
-		`SELECT model, actual_model, COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-		        COALESCE(SUM(cost),0), COALESCE(AVG(response_time_ms),0),
-		        SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END)
-		 FROM %s WHERE timestamp >= ? AND timestamp < ?
-		 GROUP BY model, actual_model ORDER BY SUM(cost) DESC LIMIT 20`,
-		table,
-	)
-	modelRows, err := s.s.QueryContext(context.Background(), modelQuery, sinceStr, untilStr)
+	modelQuery := fmt.Sprintf(`SELECT model, actual_model, COUNT(*),
+		COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+		COALESCE(SUM(cache_creation), 0), COALESCE(SUM(cache_read), 0),
+		COALESCE(SUM(cost), 0)
+		FROM %s%s GROUP BY model, actual_model`, table, whereSQL)
+	rows, err := s.s.QueryContext(context.Background(), modelQuery, args...)
 	if err != nil {
-		return nil, fmt.Errorf("summary by model: %w", err)
+		return agg, fmt.Errorf("aggregate metrics: %w", err)
 	}
-	defer modelRows.Close()
-	var byModel []ModelSummary
-	for modelRows.Next() {
-		var m ModelSummary
-		if err := modelRows.Scan(&m.Model, &m.ActualModel, &m.Requests, &m.InputTokens,
-			&m.OutputTokens, &m.Cost, &m.AvgLatencyMs, &m.ErrorCount); err != nil {
-			return nil, fmt.Errorf("scan model summary: %w", err)
+	for rows.Next() {
+		var m UsageModelAggregate
+		if err := rows.Scan(&m.Model, &m.ActualModel, &m.Requests,
+			&m.InputTokens, &m.OutputTokens, &m.CacheCreation, &m.CacheRead, &m.Cost); err != nil {
+			rows.Close()
+			return agg, fmt.Errorf("scan metrics aggregate: %w", err)
 		}
-		byModel = append(byModel, m)
+		agg.Requests += m.Requests
+		agg.InputTokens += m.InputTokens
+		agg.OutputTokens += m.OutputTokens
+		agg.CacheCreation += m.CacheCreation
+		agg.CacheRead += m.CacheRead
+		agg.Cost += m.Cost
+		agg.ByModel = append(agg.ByModel, m)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return agg, fmt.Errorf("iterate metrics aggregate: %w", err)
+	}
+	rows.Close()
+
+	boundsQuery := fmt.Sprintf("SELECT MIN(timestamp), MAX(timestamp) FROM %s%s", table, whereSQL)
+	var minTS, maxTS *string
+	if err := s.s.QueryRowContext(context.Background(), boundsQuery, args...).Scan(&minTS, &maxTS); err == nil {
+		if minTS != nil {
+			agg.Earliest, _ = time.Parse(time.RFC3339Nano, *minTS)
+		}
+		if maxTS != nil {
+			agg.Latest, _ = time.Parse(time.RFC3339Nano, *maxTS)
+		}
 	}
 
-	// Per-provider breakdown.
-	providerQuery := fmt.Sprintf(
-		`SELECT provider_key, COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-		        COALESCE(SUM(cost),0)
-		 FROM %s WHERE timestamp >= ? AND timestamp < ? AND status = 'success'
-		 GROUP BY provider_key ORDER BY SUM(cost) DESC`,
-		table,
-	)
-	provRows, err := s.s.QueryContext(context.Background(), providerQuery, sinceStr, untilStr)
-	if err != nil {
-		return nil, fmt.Errorf("summary by provider: %w", err)
-	}
-	defer provRows.Close()
-	var byProvider []ProviderSummary
-	for provRows.Next() {
-		var p ProviderSummary
-		if err := provRows.Scan(&p.ProviderKey, &p.Requests, &p.InputTokens,
-			&p.OutputTokens, &p.Cost); err != nil {
-			return nil, fmt.Errorf("scan provider summary: %w", err)
-		}
-		byProvider = append(byProvider, p)
-	}
-
-	return &Summary{
-		PeriodStart:      since.UTC().Format(time.RFC3339),
-		PeriodEnd:        until.UTC().Format(time.RFC3339),
-		TotalRequests:    totalReqs,
-		TotalInputTokens: totalIn,
-		TotalOutputTokens: totalOut,
-		TotalCost:        totalCost,
-		TotalDurationMs:  totalDur,
-		ByModel:          byModel,
-		ByProvider:       byProvider,
-	}, nil
+	return agg, nil
 }
 
 func joinClauses(clauses []string) string {

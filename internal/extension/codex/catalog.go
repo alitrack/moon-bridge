@@ -117,6 +117,7 @@ func BuildModelInfoFromRoute(alias string, ownedBy string, route config.RouteEnt
 		displayName = DisplayNameFromSlug(alias)
 	}
 	return newModelInfo(alias, displayName, route.Description, route.ContextWindow,
+		route.SupportsReasoning,
 		route.DefaultReasoningLevel, route.SupportedReasoningLevels,
 		route.SupportsReasoningSummaries, route.DefaultReasoningSummary,
 		route.BaseInstructions,
@@ -133,6 +134,7 @@ func BuildModelInfoFromProviderModel(slug string, ownedBy string, meta config.Mo
 		displayName = DisplayNameFromSlug(slug)
 	}
 	return newModelInfo(slug, displayName, meta.Description, meta.ContextWindow,
+		meta.SupportsReasoning,
 		meta.DefaultReasoningLevel, meta.SupportedReasoningLevels,
 		meta.SupportsReasoningSummaries, meta.DefaultReasoningSummary,
 		meta.BaseInstructions,
@@ -179,6 +181,7 @@ func BuildModelInfosFromConfig(providerCfg config.ProviderConfig, pluginCfg conf
 			displayName,
 			def.Description,
 			def.ContextWindow,
+			def.SupportsReasoning,
 			def.DefaultReasoningLevel,
 			def.SupportedReasoningLevels,
 			def.SupportsReasoningSummaries,
@@ -314,6 +317,12 @@ func buildModelInfosFromProviderDefs(providerCfg config.ProviderConfig) []ModelI
 				supportsReasoningSummaries = true
 			}
 		}
+		supportsReasoning := preferred.meta.SupportsReasoning
+		for _, e := range entries[1:] {
+			if e.meta.SupportsReasoning {
+				supportsReasoning = true
+			}
+		}
 
 		supportsImageDetailOriginal := preferred.meta.SupportsImageDetailOriginal
 		for _, e := range entries[1:] {
@@ -327,6 +336,7 @@ func buildModelInfosFromProviderDefs(providerCfg config.ProviderConfig) []ModelI
 			displayName,
 			description,
 			contextWindow,
+			supportsReasoning,
 			preferred.meta.DefaultReasoningLevel,
 			mergedLevels,
 			supportsReasoningSummaries,
@@ -370,6 +380,7 @@ func injectVisualModalities(models []ModelInfo, pluginCfg config.PluginConfig) [
 func newModelInfo(
 	slug, displayName, description string,
 	contextWindow int,
+	supportsReasoning bool,
 	defaultReasoningLevel string,
 	supportedLevels []config.ReasoningLevelPreset,
 	supportsReasoningSummaries bool,
@@ -378,6 +389,12 @@ func newModelInfo(
 	inputModalities []string,
 	supportsImageDetailOriginal bool,
 ) ModelInfo {
+	if !supportsReasoning {
+		defaultReasoningLevel = ""
+		supportedLevels = nil
+		supportsReasoningSummaries = false
+		defaultReasoningSummary = ""
+	}
 	var levels []ReasoningLevelPresetDTO
 	for _, p := range supportedLevels {
 		levels = append(levels, ReasoningLevelPresetDTO{Effort: p.Effort, Description: p.Description})

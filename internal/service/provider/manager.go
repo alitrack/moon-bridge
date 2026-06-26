@@ -37,6 +37,7 @@ type ProviderConfig struct {
 	ModelNames       []string             // upstream model names for this provider
 	Models           map[string]ModelMeta // full model metadata (upstream name -> meta) [deprecated: use Offers]
 	Offers           []config.OfferEntry  // model offerings with pricing (replaces Models)
+	ClientOverride   *http.Client         // optional HTTP client override (e.g. proxy-aware client)
 }
 
 // modelProviderEntry is a reverse-index entry: provider key + offer priority.
@@ -135,7 +136,7 @@ func NewAnthropicClientAdapter(client *anthropic.Client) ProviderClient {
 }
 
 type ProviderManager struct {
-	mu             sync.Mutex // guards field replacement during Reload
+	mu             sync.RWMutex // guards field replacement during Reload
 	clients        map[string]ProviderClient
 	providers      map[string]ProviderConfig       // provider key -> config (for inspection)
 	routes         map[string]ModelRoute           // model alias -> route
@@ -160,7 +161,10 @@ func NewProviderManager(providerCfgs map[string]ProviderConfig, routes map[strin
 		if cfg.BaseURL == "" {
 			return nil, fmt.Errorf("provider %q: base_url is required", key)
 		}
-		httpClient := newHTTPClient(cfg.HTTP)
+		httpClient := cfg.ClientOverride
+		if httpClient == nil {
+			httpClient = newHTTPClient(cfg.HTTP)
+		}
 		pm.clients[key] = &anthropicClientAdapter{client: anthropic.NewClient(anthropic.ClientConfig{
 			BaseURL:   cfg.BaseURL,
 			APIKey:    cfg.APIKey,
@@ -276,6 +280,8 @@ func (pm *ProviderManager) Reload(cfg config.ProviderConfig) error {
 // It returns the default provider if the alias is not explicitly routed.
 func (pm *ProviderManager) ClientFor(modelAlias string) (string, ProviderClient, error) {
 	// Direct provider/model reference.
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	if provider, upstream := ParseModelRef(modelAlias); provider != "" {
 		if client, ok := pm.clients[provider]; ok {
 			return upstream, client, nil
@@ -312,6 +318,8 @@ func (pm *ProviderManager) ClientFor(modelAlias string) (string, ProviderClient,
 // Returns error if no candidates are found.
 func (pm *ProviderManager) ResolveModel(modelName string) (*ResolvedRoute, error) {
 	// 1. Route alias (highest priority)
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	if route, ok := pm.routes[modelName]; ok {
 		providerKey := route.Provider
 		if providerKey == "" {
@@ -329,7 +337,7 @@ func (pm *ProviderManager) ResolveModel(modelName string) (*ResolvedRoute, error
 			Candidates: []ProviderCandidate{{
 				ProviderKey:   providerKey,
 				UpstreamModel: upstreamModel,
-				Protocol:      pm.ProtocolForKey(providerKey),
+				Protocol:      pm.protocolForKeyInline(providerKey),
 				Client:        client,
 			}},
 		}, nil
@@ -345,7 +353,7 @@ func (pm *ProviderManager) ResolveModel(modelName string) (*ResolvedRoute, error
 			Candidates: []ProviderCandidate{{
 				ProviderKey:   providerKey,
 				UpstreamModel: upstreamModel,
-				Protocol:      pm.ProtocolForKey(providerKey),
+				Protocol:      pm.protocolForKeyInline(providerKey),
 				Client:        client,
 			}},
 		}, nil
@@ -373,7 +381,7 @@ func (pm *ProviderManager) ResolveModel(modelName string) (*ResolvedRoute, error
 			candidates = append(candidates, ProviderCandidate{
 				ProviderKey:   entry.providerKey,
 				UpstreamModel: modelName,
-				Protocol:      pm.ProtocolForKey(entry.providerKey),
+				Protocol:      pm.protocolForKeyInline(entry.providerKey),
 				Client:        client,
 			})
 		}
@@ -441,6 +449,8 @@ func (pm *ProviderManager) ProbeWebSearchCandidate(ctx context.Context, provider
 
 // ProviderKeys returns all configured provider keys.
 func (pm *ProviderManager) ProviderKeys() []string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	keys := make([]string, 0, len(pm.clients))
 	for k := range pm.clients {
 		keys = append(keys, k)
@@ -450,6 +460,8 @@ func (pm *ProviderManager) ProviderKeys() []string {
 
 // DefaultKey returns the default provider key.
 func (pm *ProviderManager) DefaultKey() string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	return pm.defaultK
 }
 
@@ -469,10 +481,11 @@ func newHTTPClient(cfg HTTPConfig) *http.Client {
 
 	return &http.Client{
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: maxIdle,
-			IdleConnTimeout:     idleTimeout,
-			DisableCompression:  false,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   maxIdle,
+			IdleConnTimeout:       idleTimeout,
+			DisableCompression:    false,
+			ResponseHeaderTimeout: 30 * time.Second,
 		},
 	}
 }
@@ -486,6 +499,8 @@ func valueOrDefault(value, fallback string) string {
 
 // ClientForKey returns the anthropic.Client for a given provider key.
 func (pm *ProviderManager) ClientForKey(key string) (ProviderClient, error) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	client, ok := pm.clients[key]
 	if !ok {
 		return nil, fmt.Errorf("provider %q not found", key)
@@ -495,7 +510,25 @@ func (pm *ProviderManager) ClientForKey(key string) (ProviderClient, error) {
 
 // ProtocolForKey returns the protocol for a given provider key.
 // Returns "anthropic" if not configured.
+// protocolForKeyInline returns the protocol for a provider key.
+// Caller must hold pm.mu (read lock).
+func (pm *ProviderManager) protocolForKeyInline(key string) string {
+	if pm.providers == nil {
+		return "anthropic"
+	}
+	cfg, ok := pm.providers[key]
+	if !ok {
+		return "anthropic"
+	}
+	if cfg.Protocol == "" {
+		return "anthropic"
+	}
+	return cfg.Protocol
+}
+
 func (pm *ProviderManager) ProtocolForKey(key string) string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	if pm.providers == nil {
 		return "anthropic"
 	}
@@ -512,24 +545,28 @@ func (pm *ProviderManager) ProtocolForKey(key string) string {
 // ProtocolForModel returns the protocol for the provider serving the given model alias.
 // Returns "anthropic" if the model is not explicitly routed.
 func (pm *ProviderManager) ProtocolForModel(modelAlias string) string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	// Direct provider/model reference.
 	if provider, _ := ParseModelRef(modelAlias); provider != "" {
-		return pm.ProtocolForKey(provider)
+		return pm.protocolForKeyInline(provider)
 	}
 	route, ok := pm.routes[modelAlias]
 	if !ok {
-		return pm.ProtocolForKey(pm.defaultK)
+		return pm.protocolForKeyInline(pm.defaultK)
 	}
 	providerKey := route.Provider
 	if providerKey == "" {
 		providerKey = pm.defaultK
 	}
-	return pm.ProtocolForKey(providerKey)
+	return pm.protocolForKeyInline(providerKey)
 }
 
 // UpstreamModelFor returns the upstream model name for a model alias.
 func (pm *ProviderManager) UpstreamModelFor(modelAlias string) string {
 	// Direct provider/model reference.
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	if provider, upstream := ParseModelRef(modelAlias); provider != "" {
 		if _, ok := pm.clients[provider]; ok {
 			return upstream
@@ -544,6 +581,8 @@ func (pm *ProviderManager) UpstreamModelFor(modelAlias string) string {
 
 // ProviderBaseURL returns the base URL for a given provider key.
 func (pm *ProviderManager) ProviderBaseURL(key string) string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	cfg, ok := pm.providers[key]
 	if !ok {
 		return ""
@@ -553,6 +592,8 @@ func (pm *ProviderManager) ProviderBaseURL(key string) string {
 
 // ProviderAPIKey returns the API key for a given provider key.
 func (pm *ProviderManager) ProviderAPIKey(key string) string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	cfg, ok := pm.providers[key]
 	if !ok {
 		return ""
@@ -564,7 +605,24 @@ func (pm *ProviderManager) ProviderAPIKey(key string) string {
 // Falls back to defaultK when the model has no explicit route.
 func (pm *ProviderManager) ProviderKeyForModel(modelAlias string) string {
 	// Direct provider/model reference.
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	if provider, _ := ParseModelRef(modelAlias); provider != "" {
+		if _, ok := pm.clients[provider]; ok {
+			return provider
+		}
+	}
+	route, ok := pm.routes[modelAlias]
+	if !ok || route.Provider == "" {
+		return pm.defaultK
+	}
+	return route.Provider
+}
+
+// providerKeyForModelInline returns the provider key for a model alias.
+// Caller must hold pm.mu (read lock).
+func (pm *ProviderManager) providerKeyForModelInline(modelAlias string) string {
+	if provider, _ := modelref.Parse(modelAlias); provider != "" {
 		if _, ok := pm.clients[provider]; ok {
 			return provider
 		}
@@ -584,17 +642,23 @@ func WebSearchCandidateKey(providerKey, upstreamModel string) string {
 // SetResolvedWebSearch stores the resolved web search support for a provider key.
 // Also accepts model aliases for per-model resolution.
 func (pm *ProviderManager) SetResolvedWebSearch(key string, support string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
 	pm.resolvedWS[key] = support
 }
 
 // ResolvedWebSearch returns the resolved web search support for a provider key.
 // Returns empty string if not yet resolved.
 func (pm *ProviderManager) ResolvedWebSearch(key string) string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	return pm.resolvedWS[key]
 }
 
 // ModelMetaFor returns the ModelMeta for a model name within a specific provider.
 func (pm *ProviderManager) ModelMetaFor(modelName string, providerKey string) (ModelMeta, bool) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	cfg, ok := pm.providers[providerKey]
 	if !ok {
 		return ModelMeta{}, false
@@ -605,6 +669,8 @@ func (pm *ProviderManager) ModelMetaFor(modelName string, providerKey string) (M
 
 // ProviderDefForKey returns the full ProviderConfig for a given provider key.
 func (pm *ProviderManager) ProviderDefForKey(key string) (ProviderConfig, bool) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	cfg, ok := pm.providers[key]
 	if !ok {
 		return ProviderConfig{}, false
@@ -616,21 +682,47 @@ func (pm *ProviderManager) ProviderDefForKey(key string) (ProviderConfig, bool) 
 // Checks model-level first, then falls back to provider-level.
 func (pm *ProviderManager) ResolvedWebSearchForModel(modelAlias string) string {
 	// Check model-level resolution first.
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	if v, ok := pm.resolvedWS["model:"+modelAlias]; ok {
 		return v
 	}
-	if providerKey, upstreamModel, ok := pm.ProviderAndUpstreamForModel(modelAlias); ok {
+	var providerKey, upstreamModel string
+	ok := false
+	if provider, upstream := modelref.Parse(modelAlias); provider != "" {
+		if _, exists := pm.clients[provider]; exists {
+			providerKey, upstreamModel, ok = provider, upstream, true
+		}
+	}
+	if !ok {
+		if route, exists := pm.routes[modelAlias]; exists {
+			if route.Provider == "" {
+				providerKey = pm.defaultK
+			} else {
+				providerKey = route.Provider
+			}
+			upstreamModel, ok = route.Name, true
+		}
+	}
+	if !ok {
+		if pm.defaultK != "" {
+			providerKey, upstreamModel, ok = pm.defaultK, modelAlias, true
+		}
+	}
+	if ok {
 		if v, ok := pm.resolvedWS[WebSearchCandidateKey(providerKey, upstreamModel)]; ok {
 			return v
 		}
 	}
 	// Fall back to provider-level.
-	return pm.resolvedWS[pm.ProviderKeyForModel(modelAlias)]
+	return pm.resolvedWS[pm.providerKeyForModelInline(modelAlias)]
 }
 
 // ResolvedWebSearchForCandidate returns the resolved web search support for a provider/model pair.
 // Falls back to provider-level support when no candidate-specific resolution exists.
 func (pm *ProviderManager) ResolvedWebSearchForCandidate(providerKey, upstreamModel string) string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	if providerKey == "" {
 		return ""
 	}
@@ -644,6 +736,8 @@ func (pm *ProviderManager) ResolvedWebSearchForCandidate(providerKey, upstreamMo
 
 // WebSearchConfigForKey returns the configured web search support for a provider key.
 func (pm *ProviderManager) WebSearchConfigForKey(key string) string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	cfg, ok := pm.providers[key]
 	if !ok {
 		return ""
@@ -655,6 +749,8 @@ func (pm *ProviderManager) WebSearchConfigForKey(key string) string {
 // alias routed to the given provider key. Falls back to the provider's own
 // model list when no route alias references it. Returns empty string if none found.
 func (pm *ProviderManager) FirstUpstreamModelForKey(key string) string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	for _, route := range pm.routes {
 		pk := route.Provider
 		if pk == "" {
@@ -675,6 +771,8 @@ func (pm *ProviderManager) FirstUpstreamModelForKey(key string) string {
 // ProviderAndUpstreamForModel resolves the provider key and upstream model for a model alias.
 func (pm *ProviderManager) ProviderAndUpstreamForModel(modelAlias string) (providerKey string, upstreamModel string, ok bool) {
 	// Direct provider/model reference.
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	if provider, upstream := ParseModelRef(modelAlias); provider != "" {
 		if _, exists := pm.clients[provider]; exists {
 			return provider, upstream, true

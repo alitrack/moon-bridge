@@ -22,7 +22,7 @@ import "encoding/json"
 // Type values:
 //   - "text":        Text is populated
 //   - "image":       ImageData + MediaType are populated
-//   - "tool_use":    ToolUseID + ToolName + ToolInput are populated
+//   - "tool_use":    ToolUseID + ToolName + optional ToolNamespace + ToolInput are populated
 //   - "tool_result": ToolUseID + ToolResultContent are populated
 //   - "reasoning":   ReasoningText + ReasoningSignature are populated
 type CoreContentBlock struct {
@@ -37,9 +37,10 @@ type CoreContentBlock struct {
 	MediaType string `json:"media_type,omitempty"`
 
 	// Tool use (type = "tool_use")
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	ToolName  string          `json:"tool_name,omitempty"`
-	ToolInput json.RawMessage `json:"tool_input,omitempty"`
+	ToolUseID     string          `json:"tool_use_id,omitempty"`
+	ToolName      string          `json:"tool_name,omitempty"`
+	ToolNamespace string          `json:"tool_namespace,omitempty"`
+	ToolInput     json.RawMessage `json:"tool_input,omitempty"`
 
 	// Tool result (type = "tool_result")
 	ToolResultContent []CoreContentBlock `json:"tool_result_content,omitempty"`
@@ -114,7 +115,7 @@ type CoreToolChoice struct {
 // nil = use provider defaults.
 type CoreThinkingConfig struct {
 	Type         string `json:"type,omitempty"`          // "enabled" | "disabled"
-	BudgetTokens int    `json:"budget_tokens,omitempty"`  // token budget for thinking
+	BudgetTokens int    `json:"budget_tokens,omitempty"` // token budget for thinking
 }
 
 // CoreOutputConfig controls output generation behavior.
@@ -135,8 +136,8 @@ type CoreCacheControl struct {
 
 // CoreRequest is the protocol-agnostic representation of an LLM request.
 type CoreRequest struct {
-	Model    string          `json:"model"`
-	Messages []CoreMessage   `json:"messages"`
+	Model    string             `json:"model"`
+	Messages []CoreMessage      `json:"messages"`
 	System   []CoreContentBlock `json:"system,omitempty"`
 
 	// Tools
@@ -167,7 +168,6 @@ type CoreRequest struct {
 	// ProviderAdapters for Gemini read this and map to Gemini's generationConfig.
 	// Zero value (nil) = not set — adapter uses provider defaults.
 	GenerationConfig map[string]any `json:"generation_config,omitempty"`
-
 
 	// Thinking controls extended thinking/reasoning behavior (e.g. Anthropic extended thinking).
 	// nil = use provider defaults.

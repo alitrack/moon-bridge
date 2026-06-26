@@ -1561,6 +1561,53 @@ func TestToCoreResponse_ToolCalls(t *testing.T) {
 	}
 }
 
+func TestToCoreResponseWithRequest_DecodesNestedNamespaceToolCall(t *testing.T) {
+	adapter := newTestAdapter()
+	req := &format.CoreRequest{
+		Extensions: map[string]any{
+			"codex_tool_map": map[string]any{
+				"multi_agent_v1": map[string]any{
+					"kind":        "nested_namespace",
+					"openai_name": "multi_agent_v1",
+					"namespace":   "multi_agent_v1",
+				},
+			},
+		},
+	}
+	chatResp := &chat.ChatResponse{
+		ID: "chatcmpl-ns",
+		Choices: []chat.Choice{{
+			Index: 0,
+			Message: chat.ChatMessage{
+				Role: "assistant",
+				ToolCalls: []chat.ToolCall{{
+					ID: "call_wait", Type: "function",
+					Function: chat.ToolCallFunc{
+						Name:      "multi_agent_v1",
+						Arguments: json.RawMessage(`{"action":"wait_agent","targets":["a"],"timeout_ms":1000}`),
+					},
+				}},
+			},
+			FinishReason: "tool_calls",
+		}},
+	}
+
+	result, err := adapter.ToCoreResponseWithRequest(context.Background(), req, chatResp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Messages) != 1 || len(result.Messages[0].Content) != 1 {
+		t.Fatalf("unexpected messages: %+v", result.Messages)
+	}
+	block := result.Messages[0].Content[0]
+	if block.ToolName != "wait_agent" || block.ToolNamespace != "multi_agent_v1" {
+		t.Fatalf("tool fields = name %q namespace %q", block.ToolName, block.ToolNamespace)
+	}
+	if string(block.ToolInput) != `{"targets":["a"],"timeout_ms":1000}` {
+		t.Fatalf("tool input = %s", block.ToolInput)
+	}
+}
+
 func TestToCoreResponse_FinishReasonVariants(t *testing.T) {
 	adapter := newTestAdapter()
 	tests := []struct {
@@ -1730,7 +1777,7 @@ func TestToCoreStream_BasicDelta(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 
@@ -1790,7 +1837,7 @@ func TestToCoreStream_ToolCallArgsDelta(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 
@@ -1819,7 +1866,7 @@ func TestToCoreStream_EmptyChunk(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 
@@ -1842,7 +1889,7 @@ func TestToCoreStream_NoContent(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 
@@ -1869,7 +1916,7 @@ func TestToCoreStream_ContextCancel(t *testing.T) {
 
 	// Events channel should close immediately due to cancelled context.
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 	if len(evts) != 0 {
@@ -1915,7 +1962,7 @@ func TestToCoreStream_MultiChoice(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 
@@ -2290,7 +2337,7 @@ func TestToCoreStream_WithModel(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 	if len(evts) < 4 {
@@ -2318,7 +2365,7 @@ func TestToCoreStream_ContentBlockStartedNoRole(t *testing.T) {
 	}
 
 	var evts []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		evts = append(evts, e)
 	}
 	if len(evts) < 3 {
@@ -2370,7 +2417,7 @@ func TestToCoreStream_ToolCallArgsDeltaByPosition(t *testing.T) {
 		t.Fatal(err)
 	}
 	var deltas []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		if e.Type == format.CoreToolCallArgsDelta {
 			deltas = append(deltas, e)
 		}
@@ -2428,7 +2475,7 @@ func TestToCoreStream_ToolCallArgsDeltaRespectsExplicitToolIndex(t *testing.T) {
 	}
 	var started []format.CoreStreamEvent
 	var deltas []format.CoreStreamEvent
-	for e := range events {
+	for e := range events.Events {
 		if e.Type == format.CoreContentBlockStarted && e.ContentBlock != nil && e.ContentBlock.Type == "tool_use" {
 			started = append(started, e)
 		}

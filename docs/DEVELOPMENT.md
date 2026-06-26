@@ -61,6 +61,51 @@ go build -o moonbridge ./cmd/moonbridge
 go build -o worker.wasm ./cmd/cloudflare
 ```
 
+## Web Console 开发
+
+Moon Bridge Console 是嵌入到 Go 二进制中的 Vite/React 前端，生产路径为 `/console/`。
+
+```bash
+# 安装前端依赖
+npm --prefix webui install
+
+# 启动前端开发服务器，访问 http://127.0.0.1:5173/console/
+npm --prefix webui run dev
+
+# 前端单元测试、E2E 和生产构建
+npm --prefix webui test
+npm --prefix webui run e2e
+npm --prefix webui run build
+
+# 构建并同步到 Go embed 目录
+make webui-build
+
+# 构建带嵌入式 Console 的 Go 二进制
+make build-with-webui
+```
+
+开发服务器会将 `/api`、`/v1`、`/responses`、`/models` 代理到 `127.0.0.1:38440`。运行预览后端时，需要使用启用了 `persistence.active_provider` 的配置，否则 `/api/v1/` 管理 API 不会注册，Console 会显示 setup/unavailable 状态。
+
+Console 配置页使用配置图 API：
+
+- `GET /api/v1/config/graph`
+- `PATCH /api/v1/config/graph`
+- `POST /api/v1/config/graph/validate`
+- `POST /api/v1/config/resources/{kind}`
+- `DELETE /api/v1/config/resources/{kind}/{id}`
+- `GET /api/v1/logs/recent`
+- `GET /api/v1/logs/stream`
+
+相关测试命令：
+
+```bash
+npm --prefix webui test -- configGraph logs
+npm --prefix webui run e2e
+env GOCACHE=/tmp/moonbridge-go-build GOMODCACHE=/tmp/moonbridge-go-mod go test ./internal/service/api ./internal/service/webui ./internal/service/server
+```
+
+生产构建产物不会直接提交 `webui/dist/`；`make webui-build` 会把它复制到 `internal/service/webui/dist/`，该目录由 `go:embed` 打包。
+
 ## 运行
 
 ```bash
@@ -87,6 +132,7 @@ cd internal/e2e && PROVIDER=gemini go test -v -count=1 -run TestGoogleGenAIE2E
 
 # 使用 Makefile 构建与测试
 make build
+make build-with-webui
 make test
 ```
 

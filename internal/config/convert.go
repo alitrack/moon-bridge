@@ -33,9 +33,11 @@ func (cfg Config) ToFileConfig() FileConfig {
 			TavilyAPIKey:    cfg.TavilyAPIKey,
 			FirecrawlAPIKey: cfg.FirecrawlAPIKey,
 			SearchMaxRounds: cfg.SearchMaxRounds,
+			Extra:           cloneAnyMap(cfg.WebSearchExtra),
 		},
 		Cache:       toCacheFileConfig(cfg.Cache),
 		Persistence: PersistenceFileConfig{ActiveProvider: cfg.Persistence.ActiveProvider},
+		EgressProxy: cfg.EgressProxy,
 		Proxy: ProxyFileConfig{
 			Response: ProxyTargetFileConfig{
 				BaseURL: cfg.ResponseProxy.ProviderBaseURL,
@@ -120,6 +122,7 @@ func toModelDefFileConfig(def ModelDef) ModelDefFileConfig {
 		WebSearch:                toWebSearchFileConfig(def.WebSearch),
 	}
 
+	m.SupportsReasoning = boolPtr(def.SupportsReasoning)
 	if def.SupportsReasoningSummaries {
 		m.SupportsReasoningSummaries = boolPtr(true)
 	}
@@ -150,6 +153,7 @@ func toProviderDefFileConfig(def ProviderDef) ProviderDefFileConfig {
 			TavilyAPIKey:    def.TavilyAPIKey,
 			FirecrawlAPIKey: def.FirecrawlAPIKey,
 			SearchMaxRounds: def.SearchMaxRounds,
+			Extra:           cloneAnyMap(def.WebSearchExtra),
 		},
 	}
 
@@ -201,7 +205,7 @@ func toRouteFileConfig(entry RouteEntry) RouteFileConfig {
 		ContextWindow: entry.ContextWindow,
 	}
 
-	if entry.WebSearch.Support != "" {
+	if hasRuntimeWebSearchConfig(entry.WebSearch) {
 		r.WebSearch = toWebSearchFileConfig(entry.WebSearch)
 	}
 
@@ -222,13 +226,24 @@ func toWebSearchFileConfig(ws WebSearchConfig) WebSearchFileConfig {
 		TavilyAPIKey:    ws.TavilyAPIKey,
 		FirecrawlAPIKey: ws.FirecrawlAPIKey,
 		SearchMaxRounds: ws.SearchMaxRounds,
+		Extra:           cloneAnyMap(ws.Extra),
 	}
+}
+
+func hasRuntimeWebSearchConfig(ws WebSearchConfig) bool {
+	return ws.Support != "" ||
+		ws.MaxUses != 0 ||
+		ws.TavilyAPIKey != "" ||
+		ws.FirecrawlAPIKey != "" ||
+		ws.SearchMaxRounds != 0 ||
+		len(ws.Extra) > 0
 }
 
 func toExtensionFileConfig(s ExtensionSettings) ExtensionFileConfig {
 	return ExtensionFileConfig{
 		Enabled: s.Enabled,
 		Config:  cloneAnyMap(s.RawConfig),
+		Extra:   cloneAnyMap(s.Extra),
 	}
 }
 

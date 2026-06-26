@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moonbridge Webui Design"
+  short_description: "Apply Moon Bridge webui Material design rules."
+  default_prompt: "Use $moonbridge-webui-design before changing Moon Bridge webui UI components."

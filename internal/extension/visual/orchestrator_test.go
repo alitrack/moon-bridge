@@ -596,4 +596,3 @@ func TestHasAny(t *testing.T) {
 		t.Error("hasAny on empty string should be false")
 	}
 }
-

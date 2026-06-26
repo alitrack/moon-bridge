@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/format"
+	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/protocol/openai"
 )
 
@@ -73,8 +73,8 @@ func TestAnthropicE2E_TextRoundTrip(t *testing.T) {
 
 	// Step 1: Build OpenAI Responses request.
 	openAIReq := openai.ResponsesRequest{
-		Model:          "claude-3.5-sonnet",
-		Input:          json.RawMessage(`"Hello"`),
+		Model:           "claude-3.5-sonnet",
+		Input:           json.RawMessage(`"Hello"`),
 		MaxOutputTokens: 100,
 	}
 
@@ -292,7 +292,7 @@ func TestAnthropicE2E_ToolUseRoundTrip(t *testing.T) {
 				},
 			},
 		},
-		ToolChoice:     json.RawMessage(`"required"`),
+		ToolChoice:      json.RawMessage(`"required"`),
 		MaxOutputTokens: 200,
 	}
 
@@ -436,10 +436,10 @@ func TestAnthropicE2E_Streaming(t *testing.T) {
 
 	// Step 1: Build streaming OpenAI request.
 	openAIReq := openai.ResponsesRequest{
-		Model:          "claude-3.5-sonnet",
-		Input:          json.RawMessage(`"Hello streaming"`),
+		Model:           "claude-3.5-sonnet",
+		Input:           json.RawMessage(`"Hello streaming"`),
 		MaxOutputTokens: 100,
-		Stream:         true,
+		Stream:          true,
 	}
 
 	// Step 2: ClientAdapter.ToCoreRequest.
@@ -480,11 +480,17 @@ func TestAnthropicE2E_Streaming(t *testing.T) {
 	}
 
 	// Step 6: ClientStreamAdapter.FromCoreStream.
-	streamOutAny, err := clientStream.FromCoreStream(ctx, coreReq, coreEvents)
+	streamOutAny, err := clientStream.FromCoreStream(ctx, coreReq, coreEvents.Events)
 	if err != nil {
 		t.Fatalf("FromCoreStream: %v", err)
 	}
-	openAIStream := streamOutAny.(<-chan openai.StreamEvent)
+	var openAIStream <-chan openai.StreamEvent
+	oaiResult, ok := streamOutAny.(*openai.OpenAIStreamResult)
+	if ok {
+		openAIStream = oaiResult.Chan()
+	} else {
+		openAIStream = streamOutAny.(<-chan openai.StreamEvent)
+	}
 
 	// Consume the OpenAI stream and verify expected events.
 	var seenEvents []string
@@ -569,8 +575,8 @@ func TestAnthropicE2E_ErrorResponse(t *testing.T) {
 	defer mockSrv.Close()
 
 	openAIReq := openai.ResponsesRequest{
-		Model:          "claude-3.5-sonnet",
-		Input:          json.RawMessage(`"Hello"`),
+		Model:           "claude-3.5-sonnet",
+		Input:           json.RawMessage(`"Hello"`),
 		MaxOutputTokens: 100,
 	}
 
@@ -696,7 +702,7 @@ func TestAnthropicE2E_MultiTurnToolChain(t *testing.T) {
 				},
 			},
 		},
-		ToolChoice:     json.RawMessage(`"auto"`),
+		ToolChoice:      json.RawMessage(`"auto"`),
 		MaxOutputTokens: 300,
 	}
 
@@ -840,7 +846,6 @@ func TestAnthropicE2E_MultiTurnToolChain(t *testing.T) {
 	}
 }
 
-
 // ============================================================================
 
 const (
@@ -947,7 +952,7 @@ func testAnthropicRealToolCall(t *testing.T, apiKey string) {
 				"required": []any{"city"},
 			},
 		}},
-		ToolChoice:     json.RawMessage(`"auto"`),
+		ToolChoice:      json.RawMessage(`"auto"`),
 		MaxOutputTokens: 300,
 	}
 
@@ -1044,7 +1049,7 @@ func testAnthropicRealMultiTurnToolChain(t *testing.T, apiKey string) {
 				"required": []any{"city"},
 			},
 		}},
-		ToolChoice:     json.RawMessage(`"auto"`),
+		ToolChoice:      json.RawMessage(`"auto"`),
 		MaxOutputTokens: 300,
 	}
 
@@ -1109,9 +1114,9 @@ func testAnthropicRealMultiTurnToolChain(t *testing.T, apiKey string) {
 		}, anthropic.Message{
 			Role: "user",
 			Content: []anthropic.ContentBlock{{
-				Type: "tool_result",
+				Type:      "tool_result",
 				ToolUseID: toolCallID,
-				Content: []anthropic.ContentBlock{{Type: "text", Text: "The weather in Tokyo is 25 degrees and Sunny."}},
+				Content:   []anthropic.ContentBlock{{Type: "text", Text: "The weather in Tokyo is 25 degrees and Sunny."}},
 			}},
 		}),
 	}
@@ -1137,7 +1142,6 @@ func testAnthropicRealMultiTurnToolChain(t *testing.T, apiKey string) {
 		t.Logf("Turn 2 output: %q", oaiResp2.OutputText)
 	}
 }
-
 
 // Config constants (used by E2E tests)
 // ============================================================================
