@@ -14,6 +14,7 @@ import (
 	kimiworkaround "moonbridge/internal/extension/kimi_workaround"
 	mbtrics "moonbridge/internal/extension/metrics"
 	"moonbridge/internal/extension/plugin"
+	promptsanitizer "moonbridge/internal/extension/prompt_sanitizer"
 	responsestore "moonbridge/internal/extension/response_store"
 	sessionrecorder "moonbridge/internal/extension/session_recorder"
 	skillinjector "moonbridge/internal/extension/skill_injector"
@@ -50,6 +51,7 @@ func (cat BuiltinExtensionCatalog) ConfigSpecs() []config.ExtensionConfigSpec {
 	specs = append(specs, responsestore.ConfigSpecs()...)
 	specs = append(specs, sessionrecorder.ConfigSpecs()...)
 	specs = append(specs, skillinjector.ConfigSpecs()...)
+	specs = append(specs, promptsanitizer.ConfigSpecs()...)
 	return specs
 }
 
@@ -79,5 +81,6 @@ func (cat BuiltinExtensionCatalog) NewRegistry(logger *slog.Logger, cfg config.C
 	registry.Register(responsestore.NewPlugin())
 	registry.Register(sessionrecorder.NewPlugin())
 	registry.Register(skillinjector.NewPlugin())
+	registry.Register(promptsanitizer.NewPlugin())
 	return registry
 }
