@@ -468,6 +468,32 @@ func (p *DSPlugin) MutateCoreRequest(ctx context.Context, req *format.CoreReques
 		req.Extensions = make(map[string]any)
 	}
 
+	// Detect OpenAI-protocol requests (Codex / GPT clients) that route
+	// through the Anthropic adapter. These requests carry an "openai"
+	// extension block set by the OpenAI Responses adapter.
+	//
+	// DeepSeek V4 reasoning mode may emit <tool_calls> XML as plain text
+	// inside reasoning blocks instead of structured tool_use — this
+	// breaks Codex's tool execution loop. Disabling reasoning for
+	// OpenAI-originated requests avoids this until the text→tool_use
+	// response post-processor handles it.
+	isOpenAIOrigin := false
+	if openaiExt, ok := req.Extensions["openai"]; ok {
+		if _, ok := openaiExt.(map[string]any); ok {
+			isOpenAIOrigin = true
+		}
+	}
+
+	if isOpenAIOrigin {
+		// Force-disable reasoning for Codex/GPT routes to prevent
+		// text-encoded tool calls in reasoning blocks.
+		req.Thinking = &format.CoreThinkingConfig{
+			Type:         "disabled",
+			BudgetTokens: 0,
+		}
+		return
+	}
+
 	// Read thinking budget from extension config, default to 4096.
 	budgetTokens := 4096
 	if setting, ok := p.pluginCfg.Extensions[PluginName]; ok && setting.RawConfig != nil {

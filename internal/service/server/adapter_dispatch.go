@@ -661,6 +661,15 @@ func (s *Server) handleWithAdapters(
 			coreResp.Extensions["codex_tool_map"] = tm
 		}
 	}
+
+	// Parse text-encoded <tool_calls> XML emitted by DeepSeek V4
+	// reasoning mode (plain text instead of structured tool_use blocks).
+	// This fixes Codex tool execution loops that stall when tool calls
+	// appear as raw XML in the response text.
+	if parsed := deepseekv4.ParseTextToolCallsInResponse(coreResp); parsed {
+		log.Debug("adapter path: converted text <tool_calls> XML to structured tool_use blocks")
+	}
+
 	// 7. Convert CoreResponse → outbound OpenAI Response.
 	// ------------------------------------------------------------------
 	outAny, err := client.FromCoreResponse(ctx, coreResp)
